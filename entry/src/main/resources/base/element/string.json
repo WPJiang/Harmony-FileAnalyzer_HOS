@@ -1,0 +1,164 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "文件分析管理器模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "文件分析管理器主入口"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "文件分析管理器"
+    },
+    {
+      "name": "app_name",
+      "value": "文件分析管理器"
+    },
+    {
+      "name": "tab_files",
+      "value": "文件"
+    },
+    {
+      "name": "tab_categories",
+      "value": "分类"
+    },
+    {
+      "name": "tab_search",
+      "value": "搜索"
+    },
+    {
+      "name": "status_pending",
+      "value": "待分析"
+    },
+    {
+      "name": "status_preliminary",
+      "value": "初步分析"
+    },
+    {
+      "name": "status_deep",
+      "value": "深入分析"
+    },
+    {
+      "name": "category_tech",
+      "value": "技术文档"
+    },
+    {
+      "name": "category_business",
+      "value": "商业报告"
+    },
+    {
+      "name": "category_academic",
+      "value": "学术论文"
+    },
+    {
+      "name": "category_meeting",
+      "value": "会议演示"
+    },
+    {
+      "name": "category_contract",
+      "value": "合同协议"
+    },
+    {
+      "name": "category_product",
+      "value": "产品说明"
+    },
+    {
+      "name": "category_news",
+      "value": "新闻资讯"
+    },
+    {
+      "name": "category_personal",
+      "value": "个人文档"
+    },
+    {
+      "name": "category_unknown",
+      "value": "未分类"
+    },
+    {
+      "name": "search_placeholder",
+      "value": "搜索文件..."
+    },
+    {
+      "name": "search_history",
+      "value": "搜索历史"
+    },
+    {
+      "name": "no_search_history",
+      "value": "暂无搜索历史"
+    },
+    {
+      "name": "loading",
+      "value": "正在加载..."
+    },
+    {
+      "name": "no_files",
+      "value": "暂无文件"
+    },
+    {
+      "name": "add_files",
+      "value": "添加文件"
+    },
+    {
+      "name": "scan_directory",
+      "value": "扫描目录"
+    },
+    {
+      "name": "file_detail",
+      "value": "文件详情"
+    },
+    {
+      "name": "file_name",
+      "value": "文件名"
+    },
+    {
+      "name": "file_path",
+      "value": "文件路径"
+    },
+    {
+      "name": "file_size",
+      "value": "文件大小"
+    },
+    {
+      "name": "file_type",
+      "value": "文件类型"
+    },
+    {
+      "name": "analysis_status",
+      "value": "分析状态"
+    },
+    {
+      "name": "category",
+      "value": "分类"
+    },
+    {
+      "name": "confidence",
+      "value": "置信度"
+    },
+    {
+      "name": "keywords",
+      "value": "关键词"
+    },
+    {
+      "name": "description",
+      "value": "描述"
+    },
+    {
+      "name": "permission_read_media_reason",
+      "value": "用于读取媒体文件进行分析"
+    },
+    {
+      "name": "permission_write_media_reason",
+      "value": "用于保存分析结果"
+    },
+    {
+      "name": "permission_file_access_reason",
+      "value": "用于访问文件系统"
+    },
+    {
+      "name": "permission_internet_reason",
+      "value": "用于连接服务器和LLM API"
+    }
+  ]
+}

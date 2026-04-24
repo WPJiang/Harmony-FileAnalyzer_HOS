@@ -1,0 +1,51 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# HarmonyOS build outputs (large HAP files ~900MB)
+*.hap
+entry/build/
+
+# Python distribution and build files
+file_analyzer_base/dist/
+file_analyzer_base/build/
+file_analyzer_base/models/
+
+# Build logs
+*.log
+.hvigor/outputs/build-logs/
+
+# clangd cache database (large)
+.idea/.deveco/cxx/.cache/
+
+# Test documents (large files)
+test_docs/
+file_analyzer_base/test_data/
+
+# Sync cache data
+file_analyzer_base/debug_sync_data/
+
+# Native library intermediate files
+entry/src/main/cpp/libs/
+entry/libs/
+
+# Model files (large .gguf, .ms, .onnx files)
+*.gguf
+*.ms
+*.onnx
+*.onnx.data
+entry/src/main/resources/rawfile/caption/
+entry/src/main/resources/rawfile/embedding/
+text_embedding.onnx.data
+
+# Large vendor files
+entry/src/main/cpp/llama.cpp/vendor/miniaudio/miniaudio.h

@@ -1,0 +1,581 @@
+{
+    "initial_directory": "D:/jiangweipeng/trae_code/个人文件/图片sample",
+    "low_memory_mode": {
+        "enabled": true,
+        "description": "低内存设备优化模式。启用后会降低内存占用但可能增加处理时间。适用于内存≤8GB的设备。启用后建议: 1)embedding.model_name改为L6版本 2)ocr_max_image_width降至1000 3)enable_mkldnn设为false",
+        "periodic_memory_cleanup": {
+            "enabled": true,
+            "file_interval": 50,
+            "description_enabled": "是否启用定期内存清理。启用后每处理N个文件执行一次积极内存清理，降低内存占用但可能略微增加处理时间",
+            "description_file_interval": "内存清理间隔（处理多少个文件后清理一次）。推荐值: 5-10，值越小内存越低但速度越慢"
+        }
+    },
+    "classification": {
+        "method": "similarity",
+        "description": "分类方法: 'similarity' 使用语义相似度分类, 'clustering' 使用语义聚类分类, 'llm' 使用本地LLM模型分类"
+    },
+    "query": {
+        "top_k": 10,
+        "top_m": 5,
+        "description": "语义搜索参数: top_k为检索的语义块数量, top_m为返回的文件数量"
+    },
+    "logging": {
+        "enabled": true,
+        "level": "INFO",
+        "description": "日志配置: enabled为是否启用日志记录, level为日志级别(DEBUG/INFO/WARNING/ERROR)"
+    },
+    "performance": {
+        "enabled": true,
+        "log_file": "logs/performance.log",
+        "log_interval_seconds": 5,
+        "track_memory": true,
+        "track_latency": true,
+        "track_cpu": false,
+        "description": "性能监控配置: enabled为是否启用性能监控, log_file为性能日志文件路径, track_memory为是否监控内存, track_latency为是否监控时延"
+    },
+    "similarity_weights": {
+        "vector_weight": 0.35,
+        "bm25_weight": 0.3,
+        "keyword_weight": 0.35,
+        "time_weight": 0.0,
+        "location_weight": 0.0,
+        "description": "语义相似度各子相似度权重，总和应为1.0"
+    },
+    "category_text_fields": {
+        "vector": [
+            "name",
+            "description",
+            "keywords"
+        ],
+        "bm25": [
+            "name"
+        ],
+        "description": "类别文本拼接字段配置。vector: 用于生成类别向量的字段列表; bm25: 用于BM25相似度计算的字段列表。可选字段: name(类别名), description(描述), keywords(关键词)。字段按列表顺序拼接，keywords会展开为空格分隔的关键词列表"
+    },
+    "category_systems": [
+        {
+            "system_name": "默认类别体系",
+            "description": "系统内置的默认文件分类类别体系",
+            "categories": [
+                {
+                    "name": "技术文档",
+                    "description": "技术规范、API文档、技术手册、开发文档等",
+                    "keywords": [
+                        "技术",
+                        "API",
+                        "接口",
+                        "开发",
+                        "代码",
+                        "系统",
+                        "架构",
+                        "配置",
+                        "部署",
+                        "服务器",
+                        "程序",
+                        "函数",
+                        "模块",
+                        "框架",
+                        "数据库"
+                    ]
+                },
+                {
+                    "name": "商业报告",
+                    "description": "商业计划、市场分析、财务报告、商业提案等",
+                    "keywords": [
+                        "市场",
+                        "销售",
+                        "收入",
+                        "利润",
+                        "客户",
+                        "竞争",
+                        "战略",
+                        "投资",
+                        "商业",
+                        "业务",
+                        "增长",
+                        "运营",
+                        "营销",
+                        "品牌",
+                        "渠道"
+                    ]
+                },
+                {
+                    "name": "学术论文",
+                    "description": "研究论文、学术文章、研究报告、学位论文等",
+                    "keywords": [
+                        "研究",
+                        "实验",
+                        "方法",
+                        "结果",
+                        "分析",
+                        "理论",
+                        "模型",
+                        "数据",
+                        "论文",
+                        "引用",
+                        "摘要",
+                        "结论",
+                        "假设",
+                        "验证",
+                        "文献"
+                    ]
+                },
+                {
+                    "name": "会议演示",
+                    "description": "会议PPT、演讲稿、培训材料、汇报材料等",
+                    "keywords": [
+                        "会议",
+                        "演示",
+                        "培训",
+                        "演讲",
+                        "PPT",
+                        "展示",
+                        "介绍",
+                        "汇报",
+                        "方案",
+                        "计划",
+                        "议程",
+                        "讨论",
+                        "总结",
+                        "要点",
+                        "目标"
+                    ]
+                },
+                {
+                    "name": "合同协议",
+                    "description": "合同、协议、法律文件、条款文件等",
+                    "keywords": [
+                        "合同",
+                        "协议",
+                        "条款",
+                        "甲方",
+                        "乙方",
+                        "法律",
+                        "责任",
+                        "义务",
+                        "权利",
+                        "签署",
+                        "违约",
+                        "赔偿",
+                        "期限",
+                        "生效",
+                        "终止"
+                    ]
+                },
+                {
+                    "name": "产品说明",
+                    "description": "产品手册、使用指南、说明书、操作手册等",
+                    "keywords": [
+                        "产品",
+                        "功能",
+                        "使用",
+                        "操作",
+                        "说明",
+                        "指南",
+                        "特性",
+                        "规格",
+                        "型号",
+                        "安装",
+                        "设置",
+                        "步骤",
+                        "注意",
+                        "维护",
+                        "故障"
+                    ]
+                },
+                {
+                    "name": "新闻资讯",
+                    "description": "新闻报道、新闻稿、媒体文章、资讯内容等",
+                    "keywords": [
+                        "新闻",
+                        "报道",
+                        "发布",
+                        "消息",
+                        "媒体",
+                        "记者",
+                        "事件",
+                        "宣布",
+                        "最新",
+                        "动态",
+                        "采访",
+                        "声明",
+                        "关注",
+                        "热点",
+                        "头条"
+                    ]
+                },
+                {
+                    "name": "个人文档",
+                    "description": "简历、个人陈述、信函、个人记录等",
+                    "keywords": [
+                        "个人",
+                        "简历",
+                        "经历",
+                        "教育",
+                        "技能",
+                        "自我",
+                        "介绍",
+                        "申请",
+                        "工作",
+                        "职位",
+                        "求职",
+                        "面试",
+                        "推荐",
+                        "背景",
+                        "成就"
+                    ]
+                }
+            ]
+        }
+    ],
+    "categories": [
+        {
+            "name": "技术文档",
+            "description": "技术规范、API文档、技术手册、开发文档等",
+            "keywords": [
+                "技术",
+                "API",
+                "接口",
+                "开发",
+                "代码",
+                "系统",
+                "架构",
+                "配置",
+                "部署",
+                "服务器",
+                "程序",
+                "函数",
+                "模块",
+                "框架",
+                "数据库"
+            ]
+        },
+        {
+            "name": "商业报告",
+            "description": "商业计划、市场分析、财务报告、商业提案等",
+            "keywords": [
+                "市场",
+                "销售",
+                "收入",
+                "利润",
+                "客户",
+                "竞争",
+                "战略",
+                "投资",
+                "商业",
+                "业务",
+                "增长",
+                "运营",
+                "营销",
+                "品牌",
+                "渠道"
+            ]
+        },
+        {
+            "name": "学术论文",
+            "description": "研究论文、学术文章、研究报告、学位论文等",
+            "keywords": [
+                "研究",
+                "实验",
+                "方法",
+                "结果",
+                "分析",
+                "理论",
+                "模型",
+                "数据",
+                "论文",
+                "引用",
+                "摘要",
+                "结论",
+                "假设",
+                "验证",
+                "文献"
+            ]
+        },
+        {
+            "name": "会议演示",
+            "description": "会议PPT、演讲稿、培训材料、汇报材料等",
+            "keywords": [
+                "会议",
+                "演示",
+                "培训",
+                "演讲",
+                "PPT",
+                "展示",
+                "介绍",
+                "汇报",
+                "方案",
+                "计划",
+                "议程",
+                "讨论",
+                "总结",
+                "要点",
+                "目标"
+            ]
+        },
+        {
+            "name": "合同协议",
+            "description": "合同、协议、法律文件、条款文件等",
+            "keywords": [
+                "合同",
+                "协议",
+                "条款",
+                "甲方",
+                "乙方",
+                "法律",
+                "责任",
+                "义务",
+                "权利",
+                "签署",
+                "违约",
+                "赔偿",
+                "期限",
+                "生效",
+                "终止"
+            ]
+        },
+        {
+            "name": "产品说明",
+            "description": "产品手册、使用指南、说明书、操作手册等",
+            "keywords": [
+                "产品",
+                "功能",
+                "使用",
+                "操作",
+                "说明",
+                "指南",
+                "特性",
+                "规格",
+                "型号",
+                "安装",
+                "设置",
+                "步骤",
+                "注意",
+                "维护",
+                "故障"
+            ]
+        },
+        {
+            "name": "新闻资讯",
+            "description": "新闻报道、新闻稿、媒体文章、资讯内容等",
+            "keywords": [
+                "新闻",
+                "报道",
+                "发布",
+                "消息",
+                "媒体",
+                "记者",
+                "事件",
+                "宣布",
+                "最新",
+                "动态",
+                "采访",
+                "声明",
+                "关注",
+                "热点",
+                "头条"
+            ]
+        },
+        {
+            "name": "个人文档",
+            "description": "简历、个人陈述、信函、个人记录等",
+            "keywords": [
+                "个人",
+                "简历",
+                "经历",
+                "教育",
+                "技能",
+                "自我",
+                "介绍",
+                "申请",
+                "工作",
+                "职位",
+                "求职",
+                "面试",
+                "推荐",
+                "背景",
+                "成就"
+            ]
+        }
+    ],
+    "bm25": {
+        "k1": 1.5,
+        "b": 0.75,
+        "description": "BM25算法参数"
+    },
+    "clustering": {
+        "distance_metric": "cosine",
+        "incremental_cluster_ratio": 0.1,
+        "max_incremental_clusters": 20,
+        "min_incremental_clusters": 1,
+        "description": "聚类配置: distance_metric为距离度量, incremental_cluster_ratio为增量簇比例(k的10%), max/min_incremental_clusters为增量簇数量上下限"
+    },
+    "parsing": {
+        "mode": 1,
+        "description": "解析模式: 1=轻量解析, 2=深度解析",
+        "light_mode_max_length": 256,
+        "description_max_length": "轻量解析时文本内容的最大长度",
+        "pdf_image_mode": "page_render",
+        "description_pdf_image_mode": "PDF图片提取模式: 'embedded'=提取内嵌图片, 'page_render'=将每页渲染为图片保存到磁盘",
+        "pdf_image_output_dir": "cache/pdf_images",
+        "description_pdf_image_output_dir": "PDF页面渲染图片的输出目录(相对于项目根目录)",
+        "pdf_render_dpi": 100,
+        "description_pdf_render_dpi": "PDF渲染DPI(100-150推荐)，越低越快但OCR准确度可能降低"
+    },
+    "semantic_text_fields": {
+        "vector": [
+            "semantic_filename",
+            "text_description"
+        ],
+        "bm25": [
+            "semantic_filename",
+            "text_description"
+        ],
+        "description": "语义块文本拼接字段配置。vector: 用于生成语义向量的字段列表; bm25: 用于BM25相似度计算的字段列表。可选字段: semantic_filename(语义文件名), text_description(文本描述), keywords(关键词列表)。字段按列表顺序拼接，keywords会展开为空格分隔的关键词列表"
+    },
+    "semantic_representation": {
+        "image": {
+            "use_ocr": true,
+            "description": "图片文本提取方式: true=使用OCR, false=使用基础描述",
+            "ocr_model": "paddleocr",
+            "description_ocr_model": "OCR模型: paddleocr(轻量模型)",
+            "ocr_model_path": "",
+            "description_ocr_model_path": "OCR模型本地路径（留空则自动查找models/paddleocr目录）。支持两种加载模式：1)本地加载-将OCR模型放到models/paddleocr目录下自动加载；2)联网下载-首次运行时自动下载并保存到本地",
+            "ocr_max_image_width": 1500,
+            "description_ocr_max_image_width": "OCR前图片最大宽度(像素)，超过此宽度会缩小以加速OCR，0=不缩放",
+            "enable_mkldnn": true,
+            "description_enable_mkldnn": "是否启用MKL-DNN优化加速OCR。启用后: OCR速度提升约30%%，内存占用略增；禁用后: OCR较慢，内存占用较低"
+        },
+        "embedding": {
+            "type": "sentence_transformer",
+            "model_name": "paraphrase-multilingual-MiniLM-L12-v2",
+            "description_model_name": "Embedding模型选择。可选: paraphrase-multilingual-MiniLM-L12-v2(420MB,平衡性能), paraphrase-multilingual-MiniLM-L6-v2(110MB,更轻量更快,推荐低内存设备)"
+        },
+        "keyword": {
+            "method": "jieba",
+            "top_k": 10
+        },
+        "description": {
+            "max_length": 512
+        },
+        "filename_semantic": {
+            "enabled": true,
+            "description": "文件名语义分析配置。启用后会判断文件名是否包含有效语义，随机序列、时间戳等无意义文件名将被过滤",
+            "include_in_vector": true,
+            "description_include_in_vector": "是否在向量生成时包含文件名（当文件名有意义时）",
+            "include_in_bm25": true,
+            "description_include_in_bm25": "是否在BM25计算时包含文件名（当文件名有意义时）",
+            "min_meaningful_chars": 3,
+            "description_min_meaningful_chars": "最小有意义字符数",
+            "chinese_ratio_threshold": 0.3,
+            "description_chinese_ratio_threshold": "中文字符比例阈值，超过此值认为有意义"
+        }
+    },
+    "llm": {
+        "type": "cloud",
+        "description": "LLM类型: 仅支持'cloud'使用云侧大模型API",
+        "max_retries": 5,
+        "description_max_retries": "API调用失败时的最大重试次数，默认为5次。使用指数退避策略（1,2,4,8,16秒）",
+        "cloud": {
+            "config_file": "api_config.json",
+            "description_config_file": "云侧API配置文件路径，包含api_key、base_url、model等配置。请复制api_config_example.json并重命名为api_config.json，然后填入实际的API密钥",
+            "disable_proxy": true,
+            "description_disable_proxy": "是否禁用代理直连云服务，默认true"
+        }
+    },
+    "image_processing": {
+        "max_dimension": 448,
+        "description_max_dimension": "图片缩放最大尺寸（像素），保持长宽比。用于图片Caption生成前的预处理。推荐值: 224(快速), 448(平衡), 896(高质量)",
+        "image_text_extraction_method": "caption",
+        "description_image_text_extraction_method": "图片文件文本提取方式: 'ocr'使用OCR识别图片中的文字, 'caption'使用LLM生成图片描述和标签。仅对图片文件生效，其他文件中的图片始终使用OCR"
+    },
+    "image_tag_categories": {
+        "description": "图片数据默认分类体系，用于图片文件的分类",
+        "system_name": "图片数据默认分类",
+        "categories": {
+            "场景": [
+                "室内",
+                "户外",
+                "自然风光",
+                "城市街景",
+                "建筑",
+                "海滩",
+                "山脉",
+                "森林",
+                "公园",
+                "花园",
+                "田野",
+                "沙漠",
+                "雪景",
+                "夜景"
+            ],
+            "人物": [
+                "单人照",
+                "双人照",
+                "合影",
+                "自拍",
+                "家庭照",
+                "儿童",
+                "老人",
+                "朋友聚会",
+                "情侣",
+                "婚礼"
+            ],
+            "活动": [
+                "旅行",
+                "美食",
+                "运动健身",
+                "节日庆典",
+                "生日派对",
+                "毕业典礼",
+                "会议活动",
+                "演出表演",
+                "宠物",
+                "游戏娱乐"
+            ],
+            "物品": [
+                "美食饮品",
+                "服饰穿搭",
+                "电子产品",
+                "交通工具",
+                "家具家居",
+                "书籍文具",
+                "工艺品",
+                "珠宝首饰",
+                "化妆品",
+                "玩具"
+            ],
+            "摄影": [
+                "人像摄影",
+                "风景摄影",
+                "微距摄影",
+                "街拍",
+                "纪实摄影",
+                "艺术摄影",
+                "建筑摄影",
+                "美食摄影",
+                "产品摄影"
+            ],
+            "时间": [
+                "日出",
+                "日落",
+                "白天",
+                "夜晚",
+                "春天",
+                "夏天",
+                "秋天",
+                "冬天"
+            ],
+            "氛围": [
+                "温馨",
+                "浪漫",
+                "欢乐",
+                "宁静",
+                "活力",
+                "怀旧",
+                "清新",
+                "时尚"
+            ]
+        }
+    }
+}

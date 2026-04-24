@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run -n file_analyzer --no-capture-output python test_model_manager_ocr.py)",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Stop-Process -Name ''文件分析管理器'' -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Remove-Item -Path ''d:/jiangweipeng/trae_code/file_analyzer/dist'' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path ''d:/jiangweipeng/trae_code/file_analyzer/build'' -Recurse -Force -ErrorAction SilentlyContinue\")",
+      "Bash(cp \"C:/Users/Administrator/miniconda3/envs/file_analyzer/Library/bin/msvcp140_1.dll\" \"d:/jiangweipeng/trae_code/file_analyzer/dist/文件分析管理器/_internal/\")",
+      "Bash(cp \"C:/Users/Administrator/miniconda3/envs/file_analyzer/Library/bin/msvcp140_2.dll\" \"d:/jiangweipeng/trae_code/file_analyzer/dist/文件分析管理器/_internal/\")",
+      "Bash(cp \"C:/Users/Administrator/miniconda3/envs/file_analyzer/Library/bin/msvcp140_atomic_wait.dll\" \"d:/jiangweipeng/trae_code/file_analyzer/dist/文件分析管理器/_internal/\")",
+      "Bash(cp \"C:/Users/Administrator/miniconda3/envs/file_analyzer/Library/bin/vcruntime140_threads.dll\" \"d:/jiangweipeng/trae_code/file_analyzer/dist/文件分析管理器/_internal/\")",
+      "Bash(C:/Users/Administrator/miniconda3/envs/file_analyzer/python.exe test_torch_dll.py)",
+      "Bash(\"./文件分析管理器.exe\" -c \"print\\(''test''\\)\")",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"Get-Process | Where-Object { $_.Name -like ''*文件*'' -or $_.Name -like ''*python*'' } | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 5; Remove-Item -Path ''d:/jiangweipeng/trae_code/file_analyzer/dist'' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path ''d:/jiangweipeng/trae_code/file_analyzer/build'' -Recurse -Force -ErrorAction SilentlyContinue; Write-Host ''Cleaned''\")",
+      "Bash(taskkill //F //IM \"python.exe\")",
+      "Bash(cp \"d:/jiangweipeng/trae_code/file_analyzer/dist/文件分析管理器/_internal/torch/lib/\"*.dll \"d:/jiangweipeng/trae_code/file_analyzer/dist/文件分析管理器/_internal/\")"
+    ]
+  }
+}

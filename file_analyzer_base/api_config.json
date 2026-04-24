@@ -1,0 +1,9 @@
+{
+    "api_key": "sk-bdc36890140440739a0ae936deba9413",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen3-vl-32b-thinking",
+    "vision_model": "qwen3-vl-32b-thinking",
+    "timeout": 60,
+    "max_tokens": 32768,
+    "temperature": 0.7
+}

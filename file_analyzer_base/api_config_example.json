@@ -1,0 +1,9 @@
+{
+    "api_key": "your-api-key-here",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen-vl-plus",
+    "vision_model": "qwen-vl-max",
+    "timeout": 120,
+    "max_tokens": 4096,
+    "temperature": 0.7
+}

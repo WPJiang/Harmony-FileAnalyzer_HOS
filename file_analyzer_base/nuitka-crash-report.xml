@@ -1,0 +1,68 @@
+<?xml version='1.0' encoding='utf8'?>
+<nuitka-compilation-report nuitka_version="4.0.4" nuitka_commercial_version="not installed" mode="standalone" completion="error exit message (1)" exit_message="transformers: Making changes to 'transformers.cli.add_new_model_like' that cause SyntaxError 'f-string: empty expression not allowed (add_new_model_like.py, line 364)'">
+  <performance>
+    <memory_usage name="after_launch" value="32546816" />
+  </performance>
+  <data_composer blob_size="None" />
+  <command_line>
+    <option value="--mode=standalone" />
+    <option value="--output-dir=nuitka_dist" />
+    <option value="--output-filename=文件分析管理器.exe" />
+    <option value="--enable-plugin=pyqt5" />
+    <option value="--include-package=torch" />
+    <option value="--include-package=transformers" />
+    <option value="--include-package=sentence_transformers" />
+    <option value="--include-package=sklearn" />
+    <option value="--include-package=data_parser" />
+    <option value="--include-package=ui" />
+    <option value="--include-package=database" />
+    <option value="--include-package=models" />
+    <option value="--include-package=semantic_representation" />
+    <option value="--include-package=semantic_query" />
+    <option value="--include-package=semantic_classification" />
+    <option value="--include-package=semantic_clustering" />
+    <option value="--include-package=directory_scanner" />
+    <option value="--include-package=huggingface_hub" />
+    <option value="--include-package=safetensors" />
+    <option value="--nofollow-import-to=tkinter" />
+    <option value="--nofollow-import-to=matplotlib" />
+    <option value="--nofollow-import-to=pytest" />
+    <option value="--nofollow-import-to=tests" />
+    <option value="--windows-disable-console" />
+    <option value="ui/launcher.py" />
+  </command_line>
+  <plugins>
+    <plugin name="anti-bloat" user_enabled="no" />
+    <plugin name="data-files" user_enabled="no" />
+    <plugin name="delvewheel" user_enabled="no" />
+    <plugin name="dll-files" user_enabled="no" />
+    <plugin name="eventlet" user_enabled="no" />
+    <plugin name="gevent" user_enabled="no" />
+    <plugin name="gi" user_enabled="no" />
+    <plugin name="glfw" user_enabled="no" />
+    <plugin name="implicit-imports" user_enabled="no" />
+    <plugin name="kivy" user_enabled="no" />
+    <plugin name="matplotlib" user_enabled="no" />
+    <plugin name="multiprocessing" user_enabled="no" />
+    <plugin name="options-nanny" user_enabled="no" />
+    <plugin name="pbr-compat" user_enabled="no" />
+    <plugin name="pkg-resources" user_enabled="no" />
+    <plugin name="playwright" user_enabled="no" />
+    <plugin name="pyqt5" user_enabled="yes" />
+    <plugin name="pywebview" user_enabled="no" />
+    <plugin name="spacy" user_enabled="no" />
+    <plugin name="transformers" user_enabled="no" />
+  </plugins>
+  <distributions />
+  <python python_exe="${sys.prefix}\python.exe" python_flavor="Anaconda Python" python_version="3.10.19" os_name="Windows" os_release="11" arch_name="x86_64" filesystem_encoding="utf-8">
+    <search_path>
+      <path value="${cwd}" />
+      <path value="${cwd}\ui" />
+      <path value="${sys.prefix}\DLLs" />
+      <path value="${sys.prefix}\lib" />
+      <path value="${sys.prefix}" />
+      <path value="${sys.prefix}\lib\site-packages" />
+    </search_path>
+  </python>
+  <output run_filename="${cwd}\nuitka_dist\launcher.dist\文件分析管理器.exe" />
+</nuitka-compilation-report>

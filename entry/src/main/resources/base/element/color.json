@@ -1,0 +1,88 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "page_background",
+      "value": "#F5F5F5"
+    },
+    {
+      "name": "surface",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "primary",
+      "value": "#2196F3"
+    },
+    {
+      "name": "primary_dark",
+      "value": "#1976D2"
+    },
+    {
+      "name": "text_primary",
+      "value": "#212121"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#757575"
+    },
+    {
+      "name": "text_hint",
+      "value": "#BDBDBD"
+    },
+    {
+      "name": "divider",
+      "value": "#E0E0E0"
+    },
+    {
+      "name": "status_pending",
+      "value": "#FF9800"
+    },
+    {
+      "name": "status_preliminary",
+      "value": "#2196F3"
+    },
+    {
+      "name": "status_deep",
+      "value": "#4CAF50"
+    },
+    {
+      "name": "status_default",
+      "value": "#9E9E9E"
+    },
+    {
+      "name": "category_tech",
+      "value": "#2196F3"
+    },
+    {
+      "name": "category_business",
+      "value": "#4CAF50"
+    },
+    {
+      "name": "category_academic",
+      "value": "#9C27B0"
+    },
+    {
+      "name": "category_meeting",
+      "value": "#FF9800"
+    },
+    {
+      "name": "category_contract",
+      "value": "#F44336"
+    },
+    {
+      "name": "category_product",
+      "value": "#00BCD4"
+    },
+    {
+      "name": "category_news",
+      "value": "#795548"
+    },
+    {
+      "name": "category_personal",
+      "value": "#607D8B"
+    }
+  ]
+}

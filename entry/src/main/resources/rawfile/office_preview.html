@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PPTX Preview</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 0;
+            margin: 0;
+            background: #f0f0f0;
+            color: #333;
+        }
+        .toolbar {
+            background: #fff;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .file-info {
+            flex: 1;
+        }
+        .file-name {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .file-meta {
+            font-size: 12px;
+            color: #666;
+        }
+        .nav-buttons {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .nav-btn {
+            background: #1a73e8;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .nav-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .page-info {
+            font-size: 14px;
+            color: #666;
+            min-width: 80px;
+            text-align: center;
+        }
+        .slide-container {
+            display: flex;
+            justify-content: center;
+            padding: 20px;
+            min-height: calc(100vh - 60px);
+        }
+        .slide-wrapper {
+            background: white;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .slide-canvas {
+            display: block;
+        }
+        .loading {
+            text-align: center;
+            padding: 60px;
+            color: #666;
+        }
+        .error {
+            color: #d32f2f;
+            padding: 20px;
+            text-align: center;
+            background: #ffebee;
+            margin: 20px;
+            border-radius: 8px;
+        }
+        .thumbnail-strip {
+            display: flex;
+            gap: 8px;
+            padding: 12px 16px;
+            background: #e8e8e8;
+            overflow-x: auto;
+        }
+        .thumbnail {
+            width: 80px;
+            height: 60px;
+            border: 2px solid transparent;
+            border-radius: 4px;
+            cursor: pointer;
+            opacity: 0.7;
+            transition: all 0.2s;
+        }
+        .thumbnail.active {
+            border-color: #1a73e8;
+            opacity: 1;
+        }
+        .thumbnail:hover {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="toolbar" id="toolbar" style="display: none;">
+        <div class="file-info">
+            <div class="file-name" id="fileName"></div>
+            <div class="file-meta" id="fileMeta"></div>
+        </div>
+        <div class="nav-buttons">
+            <button class="nav-btn" id="prevBtn" onclick="prevSlide()">上一页</button>
+            <span class="page-info" id="pageInfo">1 / 1</span>
+            <button class="nav-btn" id="nextBtn" onclick="nextSlide()">下一页</button>
+        </div>
+    </div>
+
+    <div class="thumbnail-strip" id="thumbnailStrip" style="display: none;"></div>
+
+    <div class="slide-container" id="slideContainer">
+        <div class="loading" id="loading">等待数据...</div>
+    </div>
+
+    <script>
+        // Global state
+        var slides = [];
+        var currentSlideIndex = 0;
+        var fileInfo = null;
+        var pptxData = null;
+
+        // Slide dimensions (16:9 aspect ratio, scaled for mobile)
+        var SLIDE_WIDTH = 720;
+        var SLIDE_HEIGHT = 405;
+
+        // Logging
+        function log(msg) {
+            console.log('[PPTX] ' + msg);
+        }
+
+        // Base64 to ArrayBuffer
+        function base64ToArray(base64) {
+            log('Decoding Base64...');
+            var binary = atob(base64);
+            var bytes = new Uint8Array(binary.length);
+            for (var i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        // Parse ZIP file using Central Directory
+        function parseZIP(arrayBuffer) {
+            log('Parsing ZIP...');
+            var data = new Uint8Array(arrayBuffer);
+            var files = {};
+
+            // Find End of Central Directory
+            var pos = data.length - 22;
+            while (pos > 0) {
+                if (data[pos] === 0x50 && data[pos+1] === 0x4B &&
+                    data[pos+2] === 0x05 && data[pos+3] === 0x06) {
+                    break;
+                }
+                pos--;
+            }
+
+            if (pos <= 0) {
+                throw new Error('Invalid ZIP: no central directory');
+            }
+
+            var cdOffset = data[pos+16] | (data[pos+17]<<8) | (data[pos+18]<<16) | (data[pos+19]<<24);
+            var numEntries = data[pos+10] | (data[pos+11]<<8);
+
+            log('ZIP has ' + numEntries + ' entries, CD at ' + cdOffset);
+            pos = cdOffset;
+
+            for (var i = 0; i < numEntries; i++) {
+                // Check central directory signature
+                if (data[pos] !== 0x50 || data[pos+1] !== 0x4B ||
+                    data[pos+2] !== 0x01 || data[pos+3] !== 0x02) {
+                    log('Invalid CD entry at ' + pos + ', sig: ' + data[pos].toString(16));
+                    break;
+                }
+
+                var compression = data[pos+10] | (data[pos+11]<<8);
+                var compSize = data[pos+24] | (data[pos+25]<<8) | (data[pos+26]<<16) | (data[pos+27]<<24);
+                var nameLen = data[pos+28] | (data[pos+29]<<8);
+                var extraLen = data[pos+30] | (data[pos+31]<<8);
+                var commentLen = data[pos+32] | (data[pos+33]<<8);
+                var localOffset = data[pos+42] | (data[pos+43]<<8) | (data[pos+44]<<16) | (data[pos+45]<<24);
+
+                // Read name (UTF-8 safe)
+                var name = '';
+                for (var j = 0; j < nameLen; j++) {
+                    var byte = data[pos+46+j];
+                    if (byte < 128) {
+                        name += String.fromCharCode(byte);
+                    } else {
+                        // UTF-8 multi-byte handling
+                        if ((byte & 0xE0) === 0xC0 && j+1 < nameLen) {
+                            var byte2 = data[pos+46+j+1];
+                            name += String.fromCharCode(((byte & 0x1F) << 6) | (byte2 & 0x3F));
+                            j++;
+                        } else if ((byte & 0xF0) === 0xE0 && j+2 < nameLen) {
+                            var byte2 = data[pos+46+j+1];
+                            var byte3 = data[pos+46+j+2];
+                            name += String.fromCharCode(((byte & 0x0F) << 12) | ((byte2 & 0x3F) << 6) | (byte3 & 0x3F));
+                            j += 2;
+                        } else {
+                            name += String.fromCharCode(byte);
+                        }
+                    }
+                }
+
+                // Debug first few names
+                if (i < 5) {
+                    log('Entry ' + i + ': ' + name + ' (offset=' + localOffset + ', size=' + compSize + ')');
+                }
+
+                // Read local header to get actual data
+                if (localOffset < data.length) {
+                    var localNameLen = data[localOffset+26] | (data[localOffset+27]<<8);
+                    var localExtraLen = data[localOffset+28] | (data[localOffset+29]<<8);
+                    var dataStart = localOffset + 30 + localNameLen + localExtraLen;
+
+                    files[name] = {
+                        compression: compression,
+                        data: data.slice(dataStart, dataStart + compSize)
+                    };
+                }
+
+                pos += 46 + nameLen + extraLen + commentLen;
+            }
+
+            return files;
+        }
+
+        // Inflate DEFLATE data using pako-style algorithm
+        function inflate(data) {
+            // Check zlib header
+            if (data[0] !== 0x78 || (data[1] & 0x0F) !== 0x08) {
+                // Try raw deflate
+                return inflateRaw(data);
+            }
+
+            // Skip zlib header
+            return inflateRaw(data.slice(2, data.length - 4));
+        }
+
+        // Raw DEFLATE inflation
+        function inflateRaw(data) {
+            var output = [];
+            var pos = 0;
+            var bitBuffer = 0;
+            var bitsInBuffer = 0;
+
+            function readBits(n) {
+                while (bitsInBuffer < n) {
+                    if (pos >= data.length) return -1;
+                    bitBuffer |= data[pos++] << bitsInBuffer;
+                    bitsInBuffer += 8;
+                }
+                var result = bitBuffer & ((1 << n) - 1);
+                bitBuffer >>= n;
+                bitsInBuffer -= n;
+                return result;
+            }
+
+            function alignByte() {
+                bitBuffer = 0;
+                bitsInBuffer = 0;
+            }
+
+            // Fixed Huffman tables
+            var fixedLitLen = buildFixedLitLenTable();
+            var fixedDist = buildFixedDistTable();
+
+            while (true) {
+                var bfinal = readBits(1);
+                var btype = readBits(2);
+
+                if (btype === 0) {
+                    // Stored
+                    alignByte();
+                    var len = data[pos] | (data[pos+1] << 8);
+                    pos += 4;
+                    for (var i = 0; i < len; i++) {
+                        output.push(data[pos++]);
+                    }
+                } else if (btype === 1 || btype === 2) {
+                    // Huffman
+                    var litLenTable, distTable;
+
+                    if (btype === 1) {
+                        litLenTable = fixedLitLen;
+                        distTable = fixedDist;
+                    } else {
+                        // Dynamic - simplified
+                        var tables = readDynamicTables(readBits);
+                        litLenTable = tables.litLen;
+                        distTable = tables.dist;
+                    }
+
+                    while (true) {
+                        var sym = decodeSymbol(readBits, litLenTable);
+                        if (sym < 0 || sym === 256) break;
+
+                        if (sym < 256) {
+                            output.push(sym);
+                        } else {
+                            // Length
+                            var lenCode = sym - 257;
+                            var len = LENGTH_BASE[lenCode];
+                            var lenExtra = LENGTH_EXTRA[lenCode];
+                            if (lenExtra > 0) len += readBits(lenExtra);
+
+                            // Distance
+                            var distSym = decodeSymbol(readBits, distTable);
+                            if (distSym < 0) break;
+                            var dist = DIST_BASE[distSym];
+                            var distExtra = DIST_EXTRA[distSym];
+                            if (distExtra > 0) dist += readBits(distExtra);
+
+                            // Copy
+                            for (var i = 0; i < len; i++) {
+                                output.push(output[output.length - dist]);
+                            }
+                        }
+                    }
+                }
+
+                if (bfinal) break;
+            }
+
+            return new Uint8Array(output);
+        }
+
+        // Build fixed Huffman tables
+        function buildFixedLitLenTable() {
+            var table = [];
+            for (var i = 0; i <= 143; i++) table.push({sym: i, code: 0x30 + i, len: 8});
+            for (var i = 144; i <= 255; i++) table.push({sym: i, code: 0x190 + (i-144), len: 9});
+            for (var i = 256; i <= 279; i++) table.push({sym: i, code: i - 256, len: 7});
+            for (var i = 280; i <= 287; i++) table.push({sym: i, code: 0xC0 + (i-280), len: 8});
+            return table;
+        }
+
+        function buildFixedDistTable() {
+            var table = [];
+            for (var i = 0; i <= 31; i++) table.push({sym: i, code: i, len: 5});
+            return table;
+        }
+
+        // Decode Huffman symbol
+        function decodeSymbol(readBits, table) {
+            var code = 0;
+            var len = 0;
+            var maxLen = 0;
+
+            for (var i = 0; i < table.length; i++) {
+                if (table[i].len > maxLen) maxLen = table[i].len;
+            }
+
+            while (len <= maxLen) {
+                var bit = readBits(1);
+                if (bit < 0) return -1;
+                code = (code << 1) | bit;
+                len++;
+
+                for (var i = 0; i < table.length; i++) {
+                    if (table[i].len === len && table[i].code === code) {
+                        return table[i].sym;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        // Read dynamic Huffman tables
+        function readDynamicTables(readBits) {
+            var hlit = readBits(5) + 257;
+            var hdist = readBits(5) + 1;
+            var hclen = readBits(4) + 4;
+
+            var clOrder = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+            var clCodes = [];
+
+            for (var i = 0; i < hclen; i++) {
+                clCodes[clOrder[i]] = readBits(3);
+            }
+
+            // Simplified: return fixed tables
+            return {
+                litLen: buildFixedLitLenTable(),
+                dist: buildFixedDistTable()
+            };
+        }
+
+        // Length and distance base/extra tables
+        var LENGTH_BASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+        var LENGTH_EXTRA = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+        var DIST_BASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+        var DIST_EXTRA = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+
+        // Get file content from ZIP
+        function getFile(files, name) {
+            var entry = files[name];
+            if (!entry) return null;
+
+            if (entry.compression === 0) {
+                return new TextDecoder().decode(entry.data);
+            } else if (entry.compression === 8) {
+                try {
+                    var inflated = inflate(entry.data);
+                    return new TextDecoder().decode(inflated);
+                } catch (e) {
+                    log('Inflate error for ' + name + ': ' + e.message);
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        // Get binary file from ZIP (for images)
+        function getBinaryFile(files, name) {
+            var entry = files[name];
+            if (!entry) return null;
+
+            if (entry.compression === 0) {
+                return entry.data;
+            } else if (entry.compression === 8) {
+                try {
+                    return inflate(entry.data);
+                } catch (e) {
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        // Parse XML string to DOM
+        function parseXML(xmlStr) {
+            var parser = new DOMParser();
+            return parser.parseFromString(xmlStr, 'text/xml');
+        }
+
+        // Parse relationship file to get relationships
+        function parseRelationships(xmlStr) {
+            var doc = parseXML(xmlStr);
+            var rels = {};
+            var relNodes = doc.getElementsByTagName('Relationship');
+
+            for (var i = 0; i < relNodes.length; i++) {
+                var rel = relNodes[i];
+                var id = rel.getAttribute('Id');
+                var type = rel.getAttribute('Type');
+                var target = rel.getAttribute('Target');
+                rels[id] = { type: type, target: target };
+            }
+            return rels;
+        }
+
+        // EMUs to pixels (914400 EMUs = 1 inch, assuming 96 DPI)
+        function emuToPx(emu) {
+            return Math.round(emu * 96 / 914400);
+        }
+
+        // Parse slide content
+        function parseSlide(files, slidePath, slideRelsPath) {
+            var slideXml = getFile(files, slidePath);
+            if (!slideXml) {
+                log('Could not read slide: ' + slidePath);
+                return null;
+            }
+
+            var slide = {
+                shapes: [],
+                images: []
+            };
+
+            var doc = parseXML(slideXml);
+
+            // Debug: log raw XML
+            log('Slide XML: ' + slideXml.substring(0, 300));
+
+            // Get relationships for images
+            var rels = {};
+            if (slideRelsPath) {
+                var relsXml = getFile(files, slideRelsPath);
+                if (relsXml) {
+                    rels = parseRelationships(relsXml);
+                    log('Found ' + Object.keys(rels).length + ' relationships');
+                }
+            }
+
+            // Parse shapes (sp) - try multiple namespace variants
+            var shapes = doc.getElementsByTagName('p:sp');
+            log('Found p:sp: ' + shapes.length);
+
+            if (shapes.length === 0) {
+                // Try without namespace
+                shapes = doc.getElementsByTagName('sp');
+                log('Found sp: ' + shapes.length);
+            }
+
+            // Also try looking for any element
+            if (shapes.length === 0) {
+                var allElements = doc.getElementsByTagName('*');
+                log('Total elements in doc: ' + allElements.length);
+                for (var i = 0; i < Math.min(10, allElements.length); i++) {
+                    log('Element ' + i + ': ' + allElements[i].tagName);
+                }
+            }
+
+            for (var i = 0; i < shapes.length; i++) {
+                var shape = parseShape(shapes[i]);
+                if (shape) {
+                    slide.shapes.push(shape);
+                    if (shape.text) {
+                        log('Shape ' + i + ' text: ' + shape.text.substring(0, 30));
+                    }
+                }
+            }
+
+            // Parse pictures (pic)
+            var pics = doc.getElementsByTagName('p:pic');
+            log('Found p:pic: ' + pics.length);
+
+            for (var i = 0; i < pics.length; i++) {
+                var pic = parsePicture(pics[i], rels, files);
+                if (pic) slide.images.push(pic);
+            }
+
+            log('Slide has ' + slide.shapes.length + ' shapes, ' + slide.images.length + ' images');
+            return slide;
+        }
+
+        // Parse a shape element
+        function parseShape(spNode) {
+            var shape = {
+                type: 'shape',
+                x: 0, y: 0, width: 100, height: 50,
+                text: '',
+                fill: null,
+                fontSize: 18,
+                fontColor: '#000000',
+                bold: false,
+                align: 'left'
+            };
+
+            // Get position and size
+            var spPr = spNode.getElementsByTagName('p:spPr')[0];
+            if (spPr) {
+                var xfrm = spPr.getElementsByTagName('a:xfrm')[0];
+                if (xfrm) {
+                    var off = xfrm.getElementsByTagName('a:off')[0];
+                    var ext = xfrm.getElementsByTagName('a:ext')[0];
+                    if (off) {
+                        shape.x = emuToPx(parseInt(off.getAttribute('x')) || 0);
+                        shape.y = emuToPx(parseInt(off.getAttribute('y')) || 0);
+                    }
+                    if (ext) {
+                        shape.width = emuToPx(parseInt(ext.getAttribute('cx')) || 100);
+                        shape.height = emuToPx(parseInt(ext.getAttribute('cy')) || 50);
+                    }
+                }
+
+                // Fill color
+                var solidFill = spPr.getElementsByTagName('a:solidFill')[0];
+                if (solidFill) {
+                    var srgbClr = solidFill.getElementsByTagName('a:srgbClr')[0];
+                    if (srgbClr) {
+                        shape.fill = '#' + srgbClr.getAttribute('val');
+                    }
+                }
+            }
+
+            // Get text
+            var txBody = spNode.getElementsByTagName('p:txBody')[0];
+            if (txBody) {
+                var textParts = [];
+                var textRuns = txBody.getElementsByTagName('a:r');
+                for (var i = 0; i < textRuns.length; i++) {
+                    var t = textRuns[i].getElementsByTagName('a:t')[0];
+                    if (t && t.textContent) {
+                        textParts.push(t.textContent);
+                    }
+                }
+                shape.text = textParts.join('');
+
+                // Get text properties
+                var defRPr = txBody.getElementsByTagName('a:defRPr')[0];
+                if (defRPr) {
+                    var sz = defRPr.getAttribute('sz');
+                    if (sz) shape.fontSize = parseInt(sz) / 100;
+
+                    var b = defRPr.getAttribute('b');
+                    if (b === '1') shape.bold = true;
+
+                    // Solid fill for text color
+                    var solidFill = defRPr.getElementsByTagName('a:solidFill')[0];
+                    if (solidFill) {
+                        var srgbClr = solidFill.getElementsByTagName('a:srgbClr')[0];
+                        if (srgbClr) {
+                            shape.fontColor = '#' + srgbClr.getAttribute('val');
+                        }
+                    }
+                }
+
+                // Text alignment
+                var pPr = txBody.getElementsByTagName('a:pPr')[0];
+                if (pPr) {
+                    var algn = pPr.getAttribute('algn');
+                    if (algn === 'ctr') shape.align = 'center';
+                    else if (algn === 'r') shape.align = 'right';
+                }
+            }
+
+            return shape;
+        }
+
+        // Parse a picture element
+        function parsePicture(picNode, rels, files) {
+            var pic = {
+                type: 'image',
+                x: 0, y: 0, width: 100, height: 100,
+                data: null
+            };
+
+            // Get position
+            var spPr = picNode.getElementsByTagName('p:spPr')[0];
+            if (spPr) {
+                var xfrm = spPr.getElementsByTagName('a:xfrm')[0];
+                if (xfrm) {
+                    var off = xfrm.getElementsByTagName('a:off')[0];
+                    var ext = xfrm.getElementsByTagName('a:ext')[0];
+                    if (off) {
+                        pic.x = emuToPx(parseInt(off.getAttribute('x')) || 0);
+                        pic.y = emuToPx(parseInt(off.getAttribute('y')) || 0);
+                    }
+                    if (ext) {
+                        pic.width = emuToPx(parseInt(ext.getAttribute('cx')) || 100);
+                        pic.height = emuToPx(parseInt(ext.getAttribute('cy')) || 100);
+                    }
+                }
+            }
+
+            // Get image reference
+            var blipFill = picNode.getElementsByTagName('p:blipFill')[0];
+            if (blipFill) {
+                var blip = blipFill.getElementsByTagName('a:blip')[0];
+                if (blip) {
+                    var embedId = blip.getAttribute('r:embed') || blip.getAttribute('xmlns:r:embed');
+                    if (embedId && rels[embedId]) {
+                        var imagePath = rels[embedId].target;
+                        if (imagePath.startsWith('../')) {
+                            imagePath = imagePath.substring(3);
+                        }
+                        imagePath = 'ppt/slides/' + imagePath;
+
+                        // Try to load image
+                        var imgData = getBinaryFile(files, imagePath);
+                        if (imgData) {
+                            pic.data = imgData;
+                        }
+                    }
+                }
+            }
+
+            return pic.data ? pic : null;
+        }
+
+        // Main PPTX parser
+        function parsePPTX(arrayBuffer) {
+            log('Parsing PPTX...');
+            var files = parseZIP(arrayBuffer);
+
+            // Find all slides
+            var slideList = [];
+            var allPaths = [];
+            for (var name in files) {
+                allPaths.push(name);
+                var match = name.match(/ppt\/slides\/slide(\d+)\.xml$/);
+                if (match) {
+                    slideList.push({
+                        num: parseInt(match[1]),
+                        path: name,
+                        relsPath: 'ppt/slides/_rels/slide' + match[1] + '.xml.rels'
+                    });
+                }
+            }
+
+            // Debug: log some paths
+            log('Sample paths in ZIP: ' + allPaths.slice(0, 10).join(', '));
+            log('Looking for pattern: ppt/slides/slideN.xml');
+
+            slideList.sort(function(a, b) { return a.num - b.num; });
+            log('Found ' + slideList.length + ' slides');
+
+            var parsedSlides = [];
+            for (var i = 0; i < slideList.length; i++) {
+                var s = slideList[i];
+                log('Parsing slide ' + s.num);
+                var slide = parseSlide(files, s.path, s.relsPath);
+                if (slide) {
+                    slide.num = s.num;
+                    parsedSlides.push(slide);
+                }
+            }
+
+            return parsedSlides;
+        }
+
+        // Render slide to canvas
+        function renderSlide(slide, canvas) {
+            var ctx = canvas.getContext('2d');
+            canvas.width = SLIDE_WIDTH;
+            canvas.height = SLIDE_HEIGHT;
+
+            // Clear with white background
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, SLIDE_WIDTH, SLIDE_HEIGHT);
+
+            // Draw images first (behind text)
+            for (var i = 0; i < slide.images.length; i++) {
+                var img = slide.images[i];
+                try {
+                    var blob = new Blob([img.data], {type: 'image/png'});
+                    var url = URL.createObjectURL(blob);
+                    var image = new Image();
+                    image.src = url;
+                    // Note: This is async, might not render immediately
+                    ctx.drawImage(image, img.x, img.y, img.width, img.height);
+                } catch (e) {
+                    log('Error rendering image: ' + e.message);
+                }
+            }
+
+            // Draw shapes
+            for (var i = 0; i < slide.shapes.length; i++) {
+                var shape = slide.shapes[i];
+
+                // Draw shape background
+                if (shape.fill) {
+                    ctx.fillStyle = shape.fill;
+                    ctx.fillRect(shape.x, shape.y, shape.width, shape.height);
+                }
+
+                // Draw text
+                if (shape.text) {
+                    ctx.fillStyle = shape.fontColor;
+                    ctx.font = (shape.bold ? 'bold ' : '') + shape.fontSize + 'px Arial';
+
+                    // Text alignment
+                    if (shape.align === 'center') {
+                        ctx.textAlign = 'center';
+                        ctx.fillText(shape.text, shape.x + shape.width/2, shape.y + shape.height/2 + shape.fontSize/3);
+                    } else if (shape.align === 'right') {
+                        ctx.textAlign = 'right';
+                        ctx.fillText(shape.text, shape.x + shape.width - 5, shape.y + shape.height/2 + shape.fontSize/3);
+                    } else {
+                        ctx.textAlign = 'left';
+                        ctx.fillText(shape.text, shape.x + 5, shape.y + shape.height/2 + shape.fontSize/3);
+                    }
+
+                    // Word wrap for long text
+                    wrapText(ctx, shape.text, shape.x + 5, shape.y + shape.fontSize + 5,
+                             shape.width - 10, shape.fontSize * 1.2, shape);
+                }
+            }
+
+            return canvas;
+        }
+
+        // Word wrap text
+        function wrapText(ctx, text, x, y, maxWidth, lineHeight, shape) {
+            var words = text.split('');
+            var line = '';
+            var testLine = '';
+            var lineCount = 0;
+
+            ctx.fillStyle = shape.fontColor;
+            ctx.font = (shape.bold ? 'bold ' : '') + shape.fontSize + 'px Arial';
+            ctx.textAlign = 'left';
+
+            for (var i = 0; i < words.length; i++) {
+                testLine = line + words[i];
+                var metrics = ctx.measureText(testLine);
+                if (metrics.width > maxWidth && line.length > 0) {
+                    ctx.fillText(line, x, y + lineCount * lineHeight);
+                    line = words[i];
+                    lineCount++;
+                } else {
+                    line = testLine;
+                }
+            }
+            ctx.fillText(line, x, y + lineCount * lineHeight);
+        }
+
+        // UI Functions
+        function showSlide(index) {
+            if (index < 0 || index >= slides.length) return;
+
+            currentSlideIndex = index;
+            var slide = slides[index];
+
+            // Create canvas
+            var container = document.getElementById('slideContainer');
+            container.innerHTML = '';
+
+            var wrapper = document.createElement('div');
+            wrapper.className = 'slide-wrapper';
+
+            var canvas = document.createElement('canvas');
+            canvas.className = 'slide-canvas';
+            wrapper.appendChild(canvas);
+            container.appendChild(wrapper);
+
+            renderSlide(slide, canvas);
+
+            // Update UI
+            document.getElementById('pageInfo').textContent = (index + 1) + ' / ' + slides.length;
+            document.getElementById('prevBtn').disabled = index === 0;
+            document.getElementById('nextBtn').disabled = index === slides.length - 1;
+
+            // Update thumbnails
+            var thumbs = document.querySelectorAll('.thumbnail');
+            for (var i = 0; i < thumbs.length; i++) {
+                thumbs[i].classList.toggle('active', i === index);
+            }
+        }
+
+        function prevSlide() {
+            if (currentSlideIndex > 0) {
+                showSlide(currentSlideIndex - 1);
+            }
+        }
+
+        function nextSlide() {
+            if (currentSlideIndex < slides.length - 1) {
+                showSlide(currentSlideIndex + 1);
+            }
+        }
+
+        function createThumbnails() {
+            var strip = document.getElementById('thumbnailStrip');
+            strip.innerHTML = '';
+            strip.style.display = 'flex';
+
+            for (var i = 0; i < slides.length; i++) {
+                (function(index) {
+                    var thumbCanvas = document.createElement('canvas');
+                    thumbCanvas.className = 'thumbnail';
+                    thumbCanvas.width = 80;
+                    thumbCanvas.height = 60;
+
+                    // Scale down slide
+                    var tempCanvas = document.createElement('canvas');
+                    renderSlide(slides[index], tempCanvas);
+
+                    var ctx = thumbCanvas.getContext('2d');
+                    ctx.drawImage(tempCanvas, 0, 0, 80, 60);
+
+                    thumbCanvas.onclick = function() {
+                        showSlide(index);
+                    };
+
+                    if (index === 0) thumbCanvas.classList.add('active');
+                    strip.appendChild(thumbCanvas);
+                })(i);
+            }
+        }
+
+        // Main entry point
+        window.setPPTXContent = function(base64Content, info) {
+            log('setPPTXContent called');
+            fileInfo = info;
+
+            if (!base64Content) {
+                document.getElementById('slideContainer').innerHTML =
+                    '<div class="error">没有收到文件内容</div>';
+                return;
+            }
+
+            try {
+                pptxData = base64ToArray(base64Content);
+                slides = parsePPTX(pptxData);
+
+                if (slides.length === 0) {
+                    document.getElementById('slideContainer').innerHTML =
+                        '<div class="error">没有找到幻灯片内容</div>';
+                    return;
+                }
+
+                log('Parsed ' + slides.length + ' slides successfully');
+
+                // Show UI
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('toolbar').style.display = 'flex';
+                document.getElementById('fileName').textContent = fileInfo.name;
+                document.getElementById('fileMeta').textContent = fileInfo.type + ' - ' + fileInfo.size;
+
+                // Create thumbnails
+                createThumbnails();
+
+                // Show first slide
+                showSlide(0);
+
+            } catch (e) {
+                log('Error: ' + e.message);
+                document.getElementById('slideContainer').innerHTML =
+                    '<div class="error">解析失败: ' + e.message + '</div>';
+            }
+        };
+
+        // Ready notification
+        log('PPTX Preview ready');
+        if (window.parent) {
+            window.parent.postMessage({ type: 'ready' }, '*');
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+{
+  "include_system_dirs": false,
+  "max_depth": 3,
+  "follow_symlinks": false,
+  "exclude_patterns": [
+    "*.tmp",
+    "*.temp",
+    "~$*",
+    "*.log",
+    "Thumbs.db",
+    ".DS_Store"
+  ],
+  "include_patterns": [
+    "*.pdf",
+    "*.doc",
+    "*.docx",
+    "*.ppt",
+    "*.pptx",
+    "*.txt",
+    "*.md",
+    "*.jpg",
+    "*.jpeg",
+    "*.png",
+    "*.gif",
+    "*.bmp",
+    "*.wav",
+    "*.mp3",
+    "*.m4a",
+    "*.flac"
+  ],
+  "default_directories": {
+    "desktop": true,
+    "downloads": true,
+    "documents": true,
+    "pictures": true,
+    "videos": false,
+    "music": false
+  },
+  "custom_directories": []
+}
