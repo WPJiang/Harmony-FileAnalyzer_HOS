@@ -17,6 +17,7 @@ import { SemanticRepresentation, SemanticClustering } from '../semantic/Index';
 import { FileViewModel, FileItem } from '../viewmodel/Index';
 import { ApiService, LocalImageAnalysisService, LocalClassificationService, ClassificationResult } from '../services/Index';
 import { getDatabaseSyncService } from '../services/Index';
+import { RootDataReader, SYSTEM_DB_PATHS, HDC_COMMANDS } from '../services/Index';
 import { DataBlockDetail, SemanticBlockDetail } from '../models/ApiModels';
 import { ZipReader, ZipEntry } from '../parser/ZipReader';
 import { CaptionMode } from '../models/CaptionResultModel';
@@ -174,6 +175,16 @@ struct Index {
   @State showResetDbDialog: boolean = false;
   @State resetDbStatus: string = '';
   @State isResettingDb: boolean = false;
+
+  // System Data Access
+  @State showSystemDataPage: boolean = false;
+  @State systemDataTab: number = 0; // 0=contacts, 1=callLog, 2=sms, 3=calendar
+  @State systemContactsData: string[][] = [];
+  @State systemCallLogData: string[][] = [];
+  @State systemSmsData: string[][] = [];
+  @State systemCalendarData: string[][] = [];
+  @State isLoadingSystemData: boolean = false;
+  @State systemDataError: string = '';
 
   // Workflow step progress
   @State parseProgress: string = '';
@@ -1610,6 +1621,120 @@ struct Index {
     this.showConfirmDialog = true;
   }
 
+  // ============ System Data Access ============
+
+  /**
+   * 加载系统数据
+   * 注意：需要在root设备上执行，且需要先设置 SELinux 为 Permissive
+   */
+  private async loadSystemData(dataType: string): Promise<void> {
+    this.isLoadingSystemData = true;
+    this.systemDataError = '';
+    console.info(`[Index] Loading system data: ${dataType}`);
+
+    try {
+      const reader = new RootDataReader(this.context!);
+
+      if (dataType === 'contacts') {
+        const contacts = await reader.readContacts(50);
+        if (contacts.length === 0) {
+          this.systemContactsData = [
+            ['提示', '无数据或无法访问'],
+            ['原因', '需要root权限且设置SELinux为Permissive'],
+            ['命令', 'hdc shell "setenforce 0"']
+          ];
+          this.systemDataError = '联系人数据为空或无法访问\n请确保:\n1. 设备已root\n2. SELinux已设置为Permissive\n\n执行命令: hdc shell "setenforce 0"';
+        } else {
+          this.systemContactsData = [
+            ['ID', '姓名', '电话']
+          ];
+          for (const c of contacts) {
+            this.systemContactsData.push([
+              String(c.id),
+              c.displayName,
+              c.phoneNumber || '(无)'
+            ]);
+          }
+        }
+        this.systemDataTab = 0;
+      } else if (dataType === 'callLog') {
+        const callLogs = await reader.readCallLog(50);
+        if (callLogs.length === 0) {
+          this.systemCallLogData = [
+            ['提示', '无数据或无法访问'],
+            ['数据库', SYSTEM_DB_PATHS.callLog]
+          ];
+          this.systemDataError = '通话记录为空或无法访问';
+        } else {
+          this.systemCallLogData = [
+            ['ID', '号码', '时间', '时长(秒)', '类型', '姓名']
+          ];
+          for (const c of callLogs) {
+            const typeStr = c.type === 1 ? '来电' : c.type === 2 ? '去电' : c.type === 3 ? '未接' : '未知';
+            this.systemCallLogData.push([
+              String(c.id),
+              c.number,
+              new Date(c.date).toLocaleString(),
+              String(c.duration),
+              typeStr,
+              c.name || '(无)'
+            ]);
+          }
+        }
+        this.systemDataTab = 1;
+      } else if (dataType === 'sms') {
+        const smsList = await reader.readSms(50);
+        if (smsList.length === 0) {
+          this.systemSmsData = [
+            ['提示', '无数据或无法访问'],
+            ['数据库', SYSTEM_DB_PATHS.sms]
+          ];
+          this.systemDataError = '短信数据为空或无法访问';
+        } else {
+          this.systemSmsData = [
+            ['ID', '内容']
+          ];
+          for (const s of smsList) {
+            this.systemSmsData.push([
+              String(s.id),
+              '(数据解析待完善)'
+            ]);
+          }
+        }
+        this.systemDataTab = 2;
+      } else if (dataType === 'calendar') {
+        const events = await reader.readCalendarEvents(50);
+        if (events.length === 0) {
+          this.systemCalendarData = [
+            ['提示', '无数据或无法访问'],
+            ['数据库', SYSTEM_DB_PATHS.calendar]
+          ];
+          this.systemDataError = '日历数据为空或无法访问';
+        } else {
+          this.systemCalendarData = [
+            ['ID', '标题', '开始时间', '结束时间', '地点']
+          ];
+          for (const e of events) {
+            this.systemCalendarData.push([
+              String(e.id),
+              e.title || '(无)',
+              e.dtstart ? new Date(e.dtstart).toLocaleString() : '(无)',
+              e.dtend ? new Date(e.dtend).toLocaleString() : '(无)',
+              e.eventLocation || '(无)'
+            ]);
+          }
+        }
+        this.systemDataTab = 3;
+      }
+
+    } catch (e) {
+      console.error(`[Index] loadSystemData failed:`, e);
+      this.systemDataError = `加载失败: ${(e as Error).message}\n\n请确保:\n1. 设备已root\n2. SELinux已设置为Permissive\n\n执行命令: hdc shell "setenforce 0"`;
+    }
+
+    this.isLoadingSystemData = false;
+  }
+
   private confirmClearHistory(): void {
     this.confirmAction = 'clearHistory';
     this.dialogMessage = '确定要清空所有历史数据吗？';
@@ -2232,6 +2357,11 @@ struct Index {
         this.DrawerMenu();
       }
 
+      // System Data Page
+      if (this.showSystemDataPage) {
+        this.SystemDataPage();
+      }
+
       // About Dialog
       if (this.showAboutDialog) {
         this.AboutDialogBuilder();
@@ -2287,6 +2417,14 @@ struct Index {
 
         Divider().margin({ top: 8, bottom: 8 }).color('#E0E0E0')
 
+        this.MenuItem('系统数据获取', () => {
+          this.showDrawer = false;
+          this.showSystemDataPage = true;
+          this.loadSystemData('contacts');
+        })
+
+        Divider().margin({ top: 8, bottom: 8 }).color('#E0E0E0')
+
         this.MenuItem('清空历史数据', () => {
           this.showDrawer = false;
           this.confirmClearHistory();
@@ -2336,6 +2474,192 @@ struct Index {
     .width('100%')
     .padding({ top: 12, bottom: 12 })
     .onClick(action)
+  }
+
+  // ----------- System Data Page -----------
+  @Builder
+  SystemDataPage() {
+    Column() {
+      // Header
+      Row() {
+        Text('←')
+          .fontSize(24)
+          .fontColor($r('app.color.text_primary'))
+          .onClick(() => { this.showSystemDataPage = false; })
+
+        Text('系统数据获取')
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .margin({ left: 16 })
+
+        Blank()
+      }
+      .width('100%')
+      .padding(16)
+      .backgroundColor(Color.White)
+
+      // Tabs
+      Row() {
+        Button('联系人')
+          .fontSize(14)
+          .height(36)
+          .backgroundColor(this.systemDataTab === 0 ? '#2196F3' : '#E0E0E0')
+          .fontColor(this.systemDataTab === 0 ? Color.White : $r('app.color.text_primary'))
+          .onClick(() => {
+            this.systemDataTab = 0;
+            this.loadSystemData('contacts');
+          })
+
+        Button('通话记录')
+          .fontSize(14)
+          .height(36)
+          .backgroundColor(this.systemDataTab === 1 ? '#2196F3' : '#E0E0E0')
+          .fontColor(this.systemDataTab === 1 ? Color.White : $r('app.color.text_primary'))
+          .onClick(() => {
+            this.systemDataTab = 1;
+            this.loadSystemData('callLog');
+          })
+
+        Button('短信')
+          .fontSize(14)
+          .height(36)
+          .backgroundColor(this.systemDataTab === 2 ? '#2196F3' : '#E0E0E0')
+          .fontColor(this.systemDataTab === 2 ? Color.White : $r('app.color.text_primary'))
+          .onClick(() => {
+            this.systemDataTab = 2;
+            this.loadSystemData('sms');
+          })
+
+        Button('日历')
+          .fontSize(14)
+          .height(36)
+          .backgroundColor(this.systemDataTab === 3 ? '#2196F3' : '#E0E0E0')
+          .fontColor(this.systemDataTab === 3 ? Color.White : $r('app.color.text_primary'))
+          .onClick(() => {
+            this.systemDataTab = 3;
+            this.loadSystemData('calendar');
+          })
+      }
+      .width('100%')
+      .padding(8)
+      .justifyContent(FlexAlign.SpaceAround)
+      .backgroundColor(Color.White)
+
+      Divider().color('#E0E0E0')
+
+      // Content
+      Column() {
+        if (this.isLoadingSystemData) {
+          LoadingProgress()
+            .width(50)
+            .height(50)
+            .color('#2196F3')
+        } else if (this.systemDataError) {
+          Text(this.systemDataError)
+            .fontSize(12)
+            .fontColor($r('app.color.text_hint'))
+            .padding(16)
+            .textAlign(TextAlign.Start)
+        } else {
+          // Data table
+          this.SystemDataTable();
+        }
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .backgroundColor($r('app.color.page_background'))
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor($r('app.color.page_background'))
+  }
+
+  @Builder
+  SystemDataTable() {
+    Scroll() {
+      Column() {
+        // Get current data based on tab
+        if (this.systemDataTab === 0 && this.systemContactsData.length > 0) {
+          ForEach(this.systemContactsData, (row: string[], rowIndex: number) => {
+            Row() {
+              ForEach(row, (cell: string, colIndex: number) => {
+                Text(cell)
+                  .fontSize(rowIndex === 0 ? 13 : 12)
+                  .fontWeight(rowIndex === 0 ? FontWeight.Bold : FontWeight.Normal)
+                  .fontColor(rowIndex === 0 ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+                  .padding(8)
+                  .borderWidth(1)
+                  .borderColor('#E0E0E0')
+                  .flexGrow(colIndex === 0 ? 0 : 1)
+                  .width(colIndex === 0 ? 80 : 'auto')
+              })
+            }
+            .width('100%')
+            .backgroundColor(rowIndex === 0 ? '#F5F5F5' : Color.White)
+          })
+        } else if (this.systemDataTab === 1 && this.systemCallLogData.length > 0) {
+          ForEach(this.systemCallLogData, (row: string[], rowIndex: number) => {
+            Row() {
+              ForEach(row, (cell: string, colIndex: number) => {
+                Text(cell)
+                  .fontSize(rowIndex === 0 ? 13 : 12)
+                  .fontWeight(rowIndex === 0 ? FontWeight.Bold : FontWeight.Normal)
+                  .fontColor(rowIndex === 0 ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+                  .padding(8)
+                  .borderWidth(1)
+                  .borderColor('#E0E0E0')
+                  .flexGrow(1)
+              })
+            }
+            .width('100%')
+            .backgroundColor(rowIndex === 0 ? '#F5F5F5' : Color.White)
+          })
+        } else if (this.systemDataTab === 2 && this.systemSmsData.length > 0) {
+          ForEach(this.systemSmsData, (row: string[], rowIndex: number) => {
+            Row() {
+              ForEach(row, (cell: string, colIndex: number) => {
+                Text(cell)
+                  .fontSize(rowIndex === 0 ? 13 : 12)
+                  .fontWeight(rowIndex === 0 ? FontWeight.Bold : FontWeight.Normal)
+                  .fontColor(rowIndex === 0 ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+                  .padding(8)
+                  .borderWidth(1)
+                  .borderColor('#E0E0E0')
+                  .flexGrow(1)
+              })
+            }
+            .width('100%')
+            .backgroundColor(rowIndex === 0 ? '#F5F5F5' : Color.White)
+          })
+        } else if (this.systemDataTab === 3 && this.systemCalendarData.length > 0) {
+          ForEach(this.systemCalendarData, (row: string[], rowIndex: number) => {
+            Row() {
+              ForEach(row, (cell: string, colIndex: number) => {
+                Text(cell)
+                  .fontSize(rowIndex === 0 ? 13 : 12)
+                  .fontWeight(rowIndex === 0 ? FontWeight.Bold : FontWeight.Normal)
+                  .fontColor(rowIndex === 0 ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+                  .padding(8)
+                  .borderWidth(1)
+                  .borderColor('#E0E0E0')
+                  .flexGrow(1)
+              })
+            }
+            .width('100%')
+            .backgroundColor(rowIndex === 0 ? '#F5F5F5' : Color.White)
+          })
+        } else {
+          Text('无数据')
+            .fontSize(14)
+            .fontColor($r('app.color.text_hint'))
+            .padding(16)
+        }
+      }
+      .width('100%')
+      .padding(8)
+    }
+    .width('100%')
+    .layoutWeight(1)
   }
 
   // ----------- About Dialog -----------
