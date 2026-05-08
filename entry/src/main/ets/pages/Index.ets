@@ -18,6 +18,8 @@ import { FileViewModel, FileItem } from '../viewmodel/Index';
 import { ApiService, LocalImageAnalysisService, LocalClassificationService, ClassificationResult } from '../services/Index';
 import { getDatabaseSyncService } from '../services/Index';
 import { RootDataReader, SYSTEM_DB_PATHS, HDC_COMMANDS } from '../services/Index';
+import { EmbeddingMethodType, EmbeddingServiceFactory } from '../services/Index';
+import { OfficeConversionService, BatchConversionResult } from '../services/Index';
 import { DataBlockDetail, SemanticBlockDetail } from '../models/ApiModels';
 import { ZipReader, ZipEntry } from '../parser/ZipReader';
 import { CaptionMode } from '../models/CaptionResultModel';
@@ -160,6 +162,12 @@ struct Index {
   // UI State
   @State currentTab: number = 0; // 0=Files, 1=Preview, 2=Categories, 3=Search, 4=Settings
   @State isLoading: boolean = false;
+
+  // Initialization State (后台初始化进度)
+  @State isInitializing: boolean = false;      // 是否正在后台初始化
+  @State initProgress: string = '';            // 当前初始化步骤描述
+  @State initPercent: number = 0;              // 初始化进度百分比
+  @State servicesReady: boolean = false;       // 核心服务是否全部就绪
   @State apiConnected: boolean = false;
   @State apiStatusText: string = '未连接';
   @State isScanning: boolean = false;
@@ -186,6 +194,15 @@ struct Index {
   @State isLoadingSystemData: boolean = false;
   @State systemDataError: string = '';
 
+  // Office Format Conversion
+  @State showOfficeConvertDialog: boolean = false;
+  @State isConvertingOffice: boolean = false;
+  @State officeConversionPercent: number = 0;
+  @State convertibleFiles: string[] = [];
+  @State officeConversionResult: string = '';
+  @State officeConversionError: string = '';
+  @State convertedOutputFiles: string[] = [];  // 存储转换后的文件路径
+
   // Workflow step progress
   @State parseProgress: string = '';
   @State semanticProgress: string = '';
@@ -202,7 +219,6 @@ struct Index {
   @State encoderStatus: string = '初始化中...';
   @State isOfflineMode: boolean = false;
   @State useServer: boolean = false; // 是否使用服务器，默认不使用
-  @State preferredEncoder: string = 'mindspore'; // 编码器偏好: mindspore, api, local
 
   // Data State
   @State fileViewModel: FileViewModel = new FileViewModel();
@@ -237,7 +253,15 @@ struct Index {
   @State officePreviewError: string = '';
   private webController: webview.WebviewController = new webview.WebviewController();
 
+  // Markdown Web Preview State
+  @State markdownFileContentBase64: string = '';
+  @State markdownWebReady: boolean = false;
+  @State markdownPreviewError: string = '';
+  private markdownWebController: webview.WebviewController = new webview.WebviewController();
+
   // Services
+  // Saved settings
+  private savedApiUrl: string = 'http://127.0.0.1:8765';
   private context: common.Context | null = null;
   private dbManager: DatabaseManager | null = null;
   private dataParser: DataParser | null = null;
@@ -246,6 +270,7 @@ struct Index {
   private apiService: ApiService | null = null;
   private pdfDoc: pdfService.PdfDocument | null = null;
   private imageAnalysisService: LocalImageAnalysisService | null = null;
+  private officeConversionService: OfficeConversionService | null = null;
   // 默认使用原项目的LLM配置
   @State llmApiKey: string = 'sk-bdc36890140440739a0ae936deba9413';
   @State llmProvider: string = 'qwen';
@@ -256,6 +281,8 @@ struct Index {
   @State llmTemperature: number = 0.7;
   // 嵌入模型最大文本长度（用于语义向量生成）
   @State embeddingMaxTextLength: number = 128;
+  // 嵌入方法：'mindspore' | 'native' | 'local' | 'api'
+  @State embeddingMethod: EmbeddingMethodType = 'mindspore';
   // 解析模式: 1=轻量解析, 2=深度解析（与Python一致）
   @State parseMode: number = 1;
   // 轻量解析最大文本长度（与Python light_mode_max_length=256一致）
@@ -290,129 +317,156 @@ struct Index {
 
   aboutToAppear(): void {
     this.context = getContext(this) as common.Context;
-    this.initializeServices();
+    this.isInitializing = true;
+    this.initProgress = '正在初始化...';
+    this.initPercent = 0;
+    // 不等待，立即返回让UI显示
+    this.initializeServicesAsync();
   }
 
   // ============ Initialization ============
 
-  private async initializeServices(): Promise<void> {
+  private async loadSavedSettings(): Promise<void> {
     try {
-      this.isLoading = true;
-      this.encoderStatus = '初始化编码器...';
+      const pref = await preferences.getPreferences(this.context!, 'app_settings');
+      // 加载所有设置到状态变量
+      const savedUrl = pref.getSync('api_url', '') as string;
+      this.savedApiUrl = savedUrl || 'http://127.0.0.1:8765';
 
-      // Load saved settings
-      let apiUrl = 'http://127.0.0.1:8765';
-      try {
-        const pref = await preferences.getPreferences(this.context!, 'app_settings');
-        const savedUrl = pref.getSync('api_url', '') as string;
-        if (savedUrl) apiUrl = savedUrl;
+      const savedUseServer = pref.getSync('use_server', false) as boolean;
+      this.useServer = savedUseServer;
 
-        const savedUseServer = pref.getSync('use_server', false) as boolean;
-        this.useServer = savedUseServer;
+      // 加载LLM配置 - 如果未保存则使用默认值
+      const savedApiKey = pref.getSync('llm_api_key', '') as string;
+      if (savedApiKey) this.llmApiKey = savedApiKey;
 
-        // 加载LLM配置 - 如果未保存则使用默认值
-        const savedApiKey = pref.getSync('llm_api_key', '') as string;
-        if (savedApiKey) this.llmApiKey = savedApiKey;
+      const savedProvider = pref.getSync('llm_provider', '') as string;
+      if (savedProvider) this.llmProvider = savedProvider;
 
-        const savedProvider = pref.getSync('llm_provider', '') as string;
-        if (savedProvider) this.llmProvider = savedProvider;
+      const savedEndpoint = pref.getSync('llm_endpoint', '') as string;
+      if (savedEndpoint) this.llmEndpoint = savedEndpoint;
 
-        const savedEndpoint = pref.getSync('llm_endpoint', '') as string;
-        if (savedEndpoint) this.llmEndpoint = savedEndpoint;
+      const savedModel = pref.getSync('llm_model', '') as string;
+      if (savedModel) this.llmModel = savedModel;
 
-        const savedModel = pref.getSync('llm_model', '') as string;
-        if (savedModel) this.llmModel = savedModel;
+      // 加载LLM高级参数
+      const savedTimeout = pref.getSync('llm_timeout', 0) as number;
+      if (savedTimeout > 0) this.llmTimeout = savedTimeout;
 
-        // 加载LLM高级参数
-        const savedTimeout = pref.getSync('llm_timeout', 0) as number;
-        if (savedTimeout > 0) this.llmTimeout = savedTimeout;
+      const savedMaxTokens = pref.getSync('llm_max_tokens', 0) as number;
+      if (savedMaxTokens > 0) this.llmMaxTokens = savedMaxTokens;
 
-        const savedMaxTokens = pref.getSync('llm_max_tokens', 0) as number;
-        if (savedMaxTokens > 0) this.llmMaxTokens = savedMaxTokens;
+      const savedTemperature = pref.getSync('llm_temperature', -1) as number;
+      if (savedTemperature >= 0) this.llmTemperature = savedTemperature;
 
-        const savedTemperature = pref.getSync('llm_temperature', -1) as number;
-        if (savedTemperature >= 0) this.llmTemperature = savedTemperature;
+      // 加载调试模式配置
+      const savedDebugMode = pref.getSync('debug_mode', false) as boolean;
+      this.debugMode = savedDebugMode;
 
-        // 加载调试模式配置
-        const savedDebugMode = pref.getSync('debug_mode', false) as boolean;
-        this.debugMode = savedDebugMode;
+      const savedDebugUrl = pref.getSync('debug_server_url', '') as string;
+      if (savedDebugUrl) this.debugServerUrl = savedDebugUrl;
 
-        const savedDebugUrl = pref.getSync('debug_server_url', '') as string;
-        if (savedDebugUrl) this.debugServerUrl = savedDebugUrl;
+      // 加载图片文件文本提取方式配置
+      const savedImageTextMethod = pref.getSync('image_file_text_method', 'caption') as string;
+      this.imageFileTextMethod = savedImageTextMethod;
 
-        // 加载编码器偏好
-        const savedEncoder = pref.getSync('preferred_encoder', 'mindspore') as string;
-        this.preferredEncoder = savedEncoder;
+      const savedParsedImageMethod = pref.getSync('parsed_image_text_method', 'ocr') as string;
+      this.parsedImageTextMethod = savedParsedImageMethod;
 
-        // 加载图片文件文本提取方式配置
-        // 原始图片文件，默认caption（与Python一致）
-        const savedImageTextMethod = pref.getSync('image_file_text_method', 'caption') as string;
-        this.imageFileTextMethod = savedImageTextMethod;
+      // 加载嵌入模型最大文本长度配置
+      const savedEmbeddingMaxLen = pref.getSync('embedding_max_text_length', 128) as number;
+      if (savedEmbeddingMaxLen > 0) this.embeddingMaxTextLength = savedEmbeddingMaxLen;
 
-        // 解析得到的图片（PDF/PPT中的图片），默认ocr
-        const savedParsedImageMethod = pref.getSync('parsed_image_text_method', 'ocr') as string;
-        this.parsedImageTextMethod = savedParsedImageMethod;
-
-        // 加载嵌入模型最大文本长度配置
-        const savedEmbeddingMaxLen = pref.getSync('embedding_max_text_length', 128) as number;
-        if (savedEmbeddingMaxLen > 0) this.embeddingMaxTextLength = savedEmbeddingMaxLen;
-
-        // 加载解析模式配置（与Python一致）
-        const savedParseMode = pref.getSync('parse_mode', 1) as number;
-        if (savedParseMode === 1 || savedParseMode === 2) this.parseMode = savedParseMode;
-
-        // 加载轻量解析最大文本长度配置（与Python light_mode_max_length=256一致）
-        const savedLightModeMaxLen = pref.getSync('light_mode_max_length', 256) as number;
-        if (savedLightModeMaxLen > 0) this.lightModeMaxLength = savedLightModeMaxLen;
-
-        // 加载文本描述最大长度配置（与Python description.max_length=512一致）
-        const savedDescMaxLen = pref.getSync('description_max_length', 512) as number;
-        if (savedDescMaxLen > 0) this.descriptionMaxLength = savedDescMaxLen;
-
-        // 加载Caption生成模式配置
-        const savedCaptionMode = pref.getSync('caption_mode', '') as string;
-        if (savedCaptionMode === CaptionMode.LOCAL || savedCaptionMode === CaptionMode.CLOUD) {
-          this.captionMode = savedCaptionMode as CaptionMode;
-        }
-
-        // 加载图片缩放最大尺寸配置（与AItest项目MAX_SIZE=512一致）
-        const savedMaxDimension = pref.getSync('max_dimension', 512) as number;
-        if (savedMaxDimension > 0) this.maxDimension = savedMaxDimension;
-
-        // 加载分类方法配置（与Python一致）
-        const savedClassificationMethod = pref.getSync('classification_method', 'similarity') as string;
-        if (savedClassificationMethod) this.classificationMethod = savedClassificationMethod;
-
-        console.info('[Index] Loaded settings - useServer:', this.useServer, 'llmProvider:', this.llmProvider, 'debugMode:', this.debugMode, 'encoder:', this.preferredEncoder, 'imageFileTextMethod:', this.imageFileTextMethod, 'captionMode:', this.captionMode, 'maxDimension:', this.maxDimension, 'classificationMethod:', this.classificationMethod);
-      } catch (e) {
-        console.warn('[Index] Load settings failed:', e);
+      // 加载嵌入方法配置
+      const savedEmbeddingMethod = pref.getSync('embedding_method', 'mindspore') as string;
+      if (savedEmbeddingMethod === 'mindspore' || savedEmbeddingMethod === 'native' ||
+          savedEmbeddingMethod === 'local' || savedEmbeddingMethod === 'api') {
+        this.embeddingMethod = savedEmbeddingMethod as EmbeddingMethodType;
       }
 
-      // Initialize local services (always needed)
+      // 加载解析模式配置
+      const savedParseMode = pref.getSync('parse_mode', 1) as number;
+      if (savedParseMode === 1 || savedParseMode === 2) this.parseMode = savedParseMode;
+
+      const savedLightModeMaxLen = pref.getSync('light_mode_max_length', 256) as number;
+      if (savedLightModeMaxLen > 0) this.lightModeMaxLength = savedLightModeMaxLen;
+
+      const savedDescMaxLen = pref.getSync('description_max_length', 512) as number;
+      if (savedDescMaxLen > 0) this.descriptionMaxLength = savedDescMaxLen;
+
+      // 加载Caption生成模式配置
+      const savedCaptionMode = pref.getSync('caption_mode', '') as string;
+      if (savedCaptionMode === CaptionMode.LOCAL || savedCaptionMode === CaptionMode.CLOUD) {
+        this.captionMode = savedCaptionMode as CaptionMode;
+      }
+
+      // 加载图片缩放最大尺寸配置
+      const savedMaxDimension = pref.getSync('max_dimension', 512) as number;
+      if (savedMaxDimension > 0) this.maxDimension = savedMaxDimension;
+
+      // 加载分类方法配置
+      const savedClassificationMethod = pref.getSync('classification_method', 'similarity') as string;
+      if (savedClassificationMethod) this.classificationMethod = savedClassificationMethod;
+
+      console.info('[Index] Loaded settings - useServer:', this.useServer, 'llmProvider:', this.llmProvider, 'debugMode:', this.debugMode, 'embeddingMethod:', this.embeddingMethod, 'imageFileTextMethod:', this.imageFileTextMethod, 'captionMode:', this.captionMode, 'maxDimension:', this.maxDimension, 'classificationMethod:', this.classificationMethod);
+    } catch (e) {
+      console.warn('[Index] Load settings failed:', e);
+    }
+  }
+
+  private async initializeServicesAsync(): Promise<void> {
+    try {
+      // === 阶段1：数据库（优先，约20%进度） ===
+      this.initProgress = '正在初始化数据库...';
+      this.initPercent = 10;
+
+      // 加载保存的设置
+      await this.loadSavedSettings();
+
+      // 初始化数据库
       this.dbManager = new DatabaseManager(this.context!);
       await this.dbManager.initialize();
+      this.initPercent = 20;
 
-      // Initialize cache directories（异步）
+      // 初始化缓存
       await CacheUtils.getInstance().init(this.context! as common.UIAbilityContext);
 
-      // 使用解析模式配置初始化DataParser（与Python一致）
+      // === 阶段2：加载文件列表（约30%进度） ===
+      this.initProgress = '正在加载文件列表...';
+      this.initPercent = 25;
+      await this.loadFiles();
+      this.initPercent = 30;
+
+      // === 阶段3：语义模型（中优先级，约60%进度） ===
+      this.initProgress = '正在加载语义模型...';
+      this.initPercent = 35;
+
+      // DataParser
       this.dataParser = new DataParser(new ParseConfig(this.parseMode, this.lightModeMaxLength));
+
+      // SemanticRepresentation
       this.semanticRep = new SemanticRepresentation();
       this.semanticRep.setContext(this.context!);
-      // 设置图片文字提取方式（两个独立配置）
       this.semanticRep.setImageFileTextMethod(this.imageFileTextMethod);
       this.semanticRep.setParsedImageTextMethod(this.parsedImageTextMethod);
-      // 设置嵌入模型最大文本长度
       this.semanticRep.setEmbeddingMaxTextLength(this.embeddingMaxTextLength);
-      // 设置文本描述最大长度（与Python一致）
+      this.semanticRep.setEmbeddingMethod(this.embeddingMethod);
       this.semanticRep.setDescriptionMaxLength(this.descriptionMaxLength);
       await this.semanticRep.initialize();
+
+      // SemanticClustering
       this.semanticClustering = new SemanticClustering();
       this.semanticClustering.initialize();
+      this.initPercent = 60;
 
-      console.info('[Index] SemanticRep initialized with imageFileTextMethod:', this.imageFileTextMethod, 'parsedImageTextMethod:', this.parsedImageTextMethod, 'embeddingMaxTextLength:', this.embeddingMaxTextLength, 'parseMode:', this.parseMode, 'lightModeMaxLength:', this.lightModeMaxLength, 'descriptionMaxLength:', this.descriptionMaxLength);
+      // 检测编码器状态
+      this.encoderStatus = this.semanticRep.getEncoderInfo();
+      this.isOfflineMode = this.semanticRep.isMindSporeAvailable();
 
-      // 初始化图片分析服务
+      // === 阶段4：图片分析服务（低优先级，约80%进度） ===
+      this.initProgress = '正在初始化图片分析...';
+      this.initPercent = 65;
+
       this.imageAnalysisService = new LocalImageAnalysisService();
       this.imageAnalysisService.setContext(this.context!);
       this.imageAnalysisService.setCaptionMode(this.captionMode);
@@ -421,64 +475,55 @@ struct Index {
       this.imageAnalysisService.setTimeout(this.llmTimeout);
       this.imageAnalysisService.setMaxTokens(this.llmMaxTokens);
       this.imageAnalysisService.setTemperature(this.llmTemperature);
-      // 设置图片缩放最大尺寸（与AItest项目MAX_SIZE=512一致）
       this.imageAnalysisService.setMaxDimension(this.maxDimension);
       console.info('[Index] ImageAnalysisService initialized with maxDimension:', this.maxDimension);
 
-      // 如果是端侧模式，预加载模型
+      // 设置到semanticRep
+      this.semanticRep.setImageAnalysisService(this.imageAnalysisService);
+
+      // LOCAL模式下预加载模型
       if (this.captionMode === CaptionMode.LOCAL) {
-        console.info('[Index] Loading local caption model...');
+        this.initProgress = '正在加载本地Caption模型...';
         const loaded = await this.imageAnalysisService.loadLocalCaptionModel();
         console.info('[Index] Local caption model loaded:', loaded);
       }
+      this.initPercent = 80;
 
-      // Only connect to server if enabled
+      // === 阶段5：其他服务（约90%进度） ===
+      this.initProgress = '正在初始化转换服务...';
+      this.officeConversionService = new OfficeConversionService();
+      console.info('[Index] OfficeConversionService initialized');
+      this.initPercent = 90;
+
+      // === API连接（如果启用） ===
       if (this.useServer) {
+        this.initProgress = '正在连接服务器...';
         this.apiStatusText = '连接中...';
-        this.apiService = new ApiService(apiUrl);
+        this.apiService = new ApiService(this.savedApiUrl);
         this.semanticRep.setApiService(this.apiService);
         await this.checkApiConnection();
       } else {
-        // Local mode
         this.apiService = null;
         this.apiConnected = false;
         this.apiStatusText = '本地模式';
       }
 
-      // 检测编码器状态
-      if (this.semanticRep) {
-        this.encoderStatus = this.semanticRep.getEncoderInfo();
-        this.isOfflineMode = this.semanticRep.isMindSporeAvailable();
-      }
+      // === 完成 ===
+      this.initPercent = 100;
+      this.initProgress = '就绪';
+      this.isInitializing = false;
+      this.servicesReady = true;
 
-      await this.loadFiles();
-      this.isLoading = false;
+      console.info('[Index] All services initialized successfully');
+
     } catch (err) {
-      console.error('[Index] Init failed:', err);
-      this.isLoading = false;
+      console.error('[Index] Background initialization failed:', err);
+      this.isInitializing = false;
+      this.servicesReady = false;
+      this.initProgress = '初始化失败';
       this.apiStatusText = '本地模式';
       this.encoderStatus = '本地模式';
       this.isOfflineMode = true;
-    }
-  }
-
-  private async updateEncoderPreference(): Promise<void> {
-    if (!this.context) return;
-
-    try {
-      const pref = await preferences.getPreferences(this.context, 'app_settings');
-      await pref.put('preferred_encoder', this.preferredEncoder);
-      await pref.flush();
-
-      console.info('[Index] Encoder preference saved:', this.preferredEncoder);
-
-      // Re-check encoder status
-      if (this.semanticRep) {
-        this.encoderStatus = this.semanticRep.getEncoderInfo();
-        this.isOfflineMode = this.semanticRep.isMindSporeAvailable();
-      }
-    } catch (e) {
-      console.error('[Index] Failed to save encoder preference:', e);
     }
   }
 
@@ -558,8 +603,8 @@ struct Index {
       await pref.put('debug_mode', this.debugMode);
       await pref.put('debug_server_url', this.debugServerUrl);
       await pref.put('caption_mode', this.captionMode);
-      await pref.put('preferred_encoder', this.preferredEncoder);
       await pref.put('embedding_max_text_length', this.embeddingMaxTextLength);
+      await pref.put('embedding_method', this.embeddingMethod);
       // 保存解析模式配置（与Python一致）
       await pref.put('parse_mode', this.parseMode);
       await pref.put('light_mode_max_length', this.lightModeMaxLength);
@@ -758,6 +803,11 @@ struct Index {
   // ============ File Operations ============
 
   private async pickFiles(): Promise<void> {
+    // 检查服务是否就绪
+    if (!this.servicesReady || !this.dbManager) {
+      this.scanProgress = '等待服务初始化完成...';
+      return;
+    }
     try {
       this.isScanning = true;
       this.scanProgress = '选择文件...';
@@ -773,10 +823,16 @@ struct Index {
     } catch (err) {
       console.error('[Index] Pick failed:', err);
       this.isScanning = false;
+      this.scanProgress = '';
     }
   }
 
   private async processSelectedFiles(uris: string[]): Promise<void> {
+    // 检查服务是否就绪
+    if (!this.servicesReady || !this.dbManager) {
+      this.processProgress = '等待服务初始化完成...';
+      return;
+    }
     let ok = 0, fail = 0;
     for (let i = 0; i < uris.length; i++) {
       this.scanProgress = `入库 ${i + 1}/${uris.length}`;
@@ -949,6 +1005,10 @@ struct Index {
       }
       this.semanticRep.setImageFileTextMethod(this.imageFileTextMethod);
       this.semanticRep.setParsedImageTextMethod(this.parsedImageTextMethod);
+      // 如果有 imageAnalysisService，设置到 semanticRep
+      if (this.imageAnalysisService) {
+        this.semanticRep.setImageAnalysisService(this.imageAnalysisService);
+      }
       await this.semanticRep.initialize();
       console.info('[Index] SemanticRep initialized (new instance)');
     }
@@ -1624,6 +1684,116 @@ struct Index {
   // ============ System Data Access ============
 
   /**
+   * 扫描可转换的Office文件
+   */
+  private async scanConvertibleFiles(): Promise<void> {
+    console.info('[Index] Scanning for convertible Office files...');
+    this.convertibleFiles = [];
+    this.officeConversionResult = '';
+    this.officeConversionError = '';
+    this.officeConversionPercent = 0;
+
+    try {
+      // Scan from fileViewModel (already loaded files)
+      for (const file of this.fileViewModel.files) {
+        const filePath: string = file.path;
+        const ext: string = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+
+        if (ext === '.xls' || ext === '.doc' || ext === '.ppt') {
+          this.convertibleFiles.push(filePath);
+          console.info(`[Index] Found convertible file: ${filePath}`);
+        }
+      }
+
+      // Also scan filesDir for any additional files
+      const filesDir: string = this.context!.filesDir;
+      try {
+        const dirs: string[] = await fileIo.listFile(filesDir);
+        for (const fileName of dirs) {
+          const filePath: string = `${filesDir}/${fileName}`;
+          const ext: string = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+
+          if (ext === '.xls' || ext === '.doc' || ext === '.ppt') {
+            // Check if not already added
+            if (!this.convertibleFiles.includes(filePath)) {
+              this.convertibleFiles.push(filePath);
+              console.info(`[Index] Found convertible file in filesDir: ${filePath}`);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`[Index] Failed to list filesDir: ${String(e)}`);
+      }
+
+      console.info(`[Index] Found ${this.convertibleFiles.length} convertible files`);
+    } catch (error) {
+      this.officeConversionError = `扫描失败: ${String(error)}`;
+      console.error(`[Index] Scan failed: ${String(error)}`);
+    }
+  }
+
+  /**
+   * 开始Office格式转换
+   */
+  private async startOfficeConversion(): Promise<void> {
+    console.info('[Index] Starting Office conversion...');
+    this.isConvertingOffice = true;
+    this.officeConversionPercent = 0;
+    this.officeConversionResult = '';
+    this.officeConversionError = '';
+    this.convertedOutputFiles = [];
+
+    if (!this.officeConversionService) {
+      this.officeConversionService = new OfficeConversionService();
+    }
+
+    // Set output directory to cache directory (for sync)
+    this.officeConversionService.setOutputDirectory(this.context!.cacheDir);
+
+    const totalFiles = this.convertibleFiles.length;
+    let successCount = 0;
+    let failedCount = 0;
+
+    for (let i = 0; i < this.convertibleFiles.length; i++) {
+      const filePath = this.convertibleFiles[i];
+      console.info(`[Index] Converting: ${filePath}`);
+
+      try {
+        const result = await this.officeConversionService.convertOfficeFile(filePath);
+
+        if (result.success) {
+          successCount++;
+          this.convertedOutputFiles.push(result.outputPath);
+          console.info(`[Index] Conversion success: ${result.outputPath}`);
+        } else {
+          failedCount++;
+          console.error(`[Index] Conversion failed: ${filePath}`);
+        }
+      } catch (error) {
+        failedCount++;
+        console.error(`[Index] Conversion error: ${String(error)}`);
+      }
+
+      this.officeConversionPercent = Math.round((i + 1) / totalFiles * 100);
+    }
+
+    this.isConvertingOffice = false;
+
+    // 构建结果消息，包含输出文件路径
+    let resultMsg = `转换完成: ${successCount} 成功, ${failedCount} 失败`;
+    if (this.convertedOutputFiles.length > 0) {
+      resultMsg += `\n\n转换后的文件:\n`;
+      for (const outputPath of this.convertedOutputFiles) {
+        const fileName = outputPath.substring(outputPath.lastIndexOf('/') + 1);
+        resultMsg += `• ${fileName}\n`;
+      }
+      resultMsg += `\n文件保存在缓存目录的 converted 子目录\n可通过"设置页同步"上传到服务端`;
+    }
+    this.officeConversionResult = resultMsg;
+    console.info(`[Index] Conversion completed: ${successCount} success, ${failedCount} failed`);
+  }
+
+  /**
    * 加载系统数据
    * 注意：需要在root设备上执行，且需要先设置 SELinux 为 Permissive
    */
@@ -1872,6 +2042,10 @@ struct Index {
         // Load PDF and render first page
         console.info('[Index] Loading PDF preview...');
         await this.loadPdfPreview(file.path);
+      } else if (this.isMarkdownFile(ext)) {
+        // Markdown files - use Web preview
+        console.info('[Index] Loading Markdown preview...');
+        await this.loadMarkdownPreview(file.path);
       } else if (this.isTextFile(ext)) {
         // Load text file content
         console.info('[Index] Loading text preview...');
@@ -1912,8 +2086,13 @@ struct Index {
   }
 
   private isTextFile(ext: string): boolean {
-    const textExts = ['.txt', '.md', '.json', '.xml', '.html', '.csv', '.py', '.js', '.css', '.log'];
+    const textExts = ['.txt', '.json', '.xml', '.html', '.csv', '.py', '.js', '.css', '.log'];
     return textExts.includes(ext.toLowerCase());
+  }
+
+  private isMarkdownFile(ext: string): boolean {
+    const markdownExts = ['.md', '.markdown'];
+    return markdownExts.includes(ext.toLowerCase());
   }
 
   private isOfficeFile(ext: string): boolean {
@@ -2296,6 +2475,58 @@ struct Index {
     }
   }
 
+  private async loadMarkdownPreview(filePath: string): Promise<void> {
+    try {
+      console.info('[Index] Opening Markdown file:', filePath);
+      this.markdownPreviewError = '';
+      this.markdownWebReady = false;
+      this.markdownFileContentBase64 = '';
+
+      const file = await fileIo.open(filePath, fileIo.OpenMode.READ_ONLY);
+      console.info('[Index] Markdown file opened, fd:', file.fd);
+
+      const stat = await fileIo.stat(file.fd);
+      console.info('[Index] Markdown file size:', stat.size);
+
+      const maxReadSize = Math.min(stat.size, 100000); // Limit to 100KB for markdown
+      const buffer = new ArrayBuffer(maxReadSize);
+
+      await fileIo.read(file.fd, buffer);
+      await fileIo.close(file.fd);
+
+      // Convert to Base64 for Web component
+      const bytes = new Uint8Array(buffer);
+      const base64Helper = new util.Base64Helper();
+      this.markdownFileContentBase64 = base64Helper.encodeToStringSync(bytes);
+
+      // Set preview content info
+      this.previewContent = `文件: ${decodeFileName(this.selectedFile?.name || '')}\n类型: Markdown文档\n大小: ${this.fileViewModel.formatFileSize(stat.size)}`;
+
+      if (stat.size > maxReadSize) {
+        this.previewContent += '\n(文件较长，仅显示前100KB)';
+      }
+
+      console.info('[Index] Markdown content prepared for Web preview, base64 length:', this.markdownFileContentBase64.length);
+    } catch (e) {
+      console.error('[Index] Markdown preview failed:', JSON.stringify(e));
+      this.markdownPreviewError = '加载Markdown文件失败';
+      this.previewContent = `Markdown预览失败: ${this.selectedFile?.name || ''}`;
+    }
+  }
+
+  private sendMarkdownFileToWeb(): void {
+    if (this.markdownFileContentBase64 && this.markdownWebReady) {
+      const jsCode = `window.setMarkdownContent("${this.markdownFileContentBase64}")`;
+      console.info('[Index] Sending Markdown content to Web, length:', jsCode.length);
+      this.markdownWebController.runJavaScript(jsCode)
+        .then(() => console.info('[Index] Markdown content sent successfully'))
+        .catch((err: Error) => {
+          console.error('[Index] Failed to send Markdown content:', err);
+          this.markdownPreviewError = '渲染失败';
+        });
+    }
+  }
+
   private prevPage(): void {
     if (this.previewPageNumber > 1) {
       this.renderPdfPage(this.previewPageNumber - 1);
@@ -2339,13 +2570,28 @@ struct Index {
   build() {
     Stack() {
       Column() {
-        if (this.isLoading) {
-          this.LoadingView();
-        } else {
-          this.TitleBar();
-          this.WorkflowBar();
-          this.TabContent();
-          this.BottomTabs();
+        // 主UI立即显示
+        this.TitleBar();
+        this.WorkflowBar();
+        this.TabContent();
+        this.BottomTabs();
+
+        // 后台初始化进度条（底部）
+        if (this.isInitializing) {
+          Row() {
+            Progress({ value: this.initPercent, total: 100, type: ProgressType.Linear })
+              .width('60%')
+              .color($r('app.color.primary'))
+            Text(this.initProgress)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .margin({ left: 8 })
+          }
+          .width('100%')
+          .height(28)
+          .backgroundColor('#F0F0F0')
+          .padding({ left: 16, right: 16 })
+          .justifyContent(FlexAlign.Center)
         }
       }
       .width('100%')
@@ -2360,6 +2606,11 @@ struct Index {
       // System Data Page
       if (this.showSystemDataPage) {
         this.SystemDataPage();
+      }
+
+      // Office Conversion Dialog
+      if (this.showOfficeConvertDialog) {
+        this.OfficeConvertDialog();
       }
 
       // About Dialog
@@ -2423,6 +2674,12 @@ struct Index {
           this.loadSystemData('contacts');
         })
 
+        this.MenuItem('Office格式升级', () => {
+          this.showDrawer = false;
+          this.showOfficeConvertDialog = true;
+          this.scanConvertibleFiles();
+        })
+
         Divider().margin({ top: 8, bottom: 8 }).color('#E0E0E0')
 
         this.MenuItem('清空历史数据', () => {
@@ -2474,6 +2731,127 @@ struct Index {
     .width('100%')
     .padding({ top: 12, bottom: 12 })
     .onClick(action)
+  }
+
+  // ----------- Office Conversion Dialog -----------
+  @Builder
+  OfficeConvertDialog() {
+    Column() {
+      // Header
+      Row() {
+        Text('Office格式升级')
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+
+        Blank()
+
+        Text('×')
+          .fontSize(24)
+          .fontColor('#666666')
+          .onClick(() => { this.showOfficeConvertDialog = false; })
+      }
+      .width('100%')
+      .padding(16)
+      .backgroundColor(Color.White)
+
+      Divider().color('#E0E0E0')
+
+      // Content
+      Column() {
+        if (this.convertibleFiles.length === 0) {
+          Text('未找到可转换的Office文件')
+            .fontSize(14)
+            .fontColor($r('app.color.text_secondary'))
+            .padding(16)
+        } else {
+          Text(`发现 ${this.convertibleFiles.length} 个可转换文件`)
+            .fontSize(14)
+            .fontColor($r('app.color.text_secondary'))
+            .margin({ top: 8, bottom: 8 })
+
+          // File list
+          Scroll() {
+            Column() {
+              ForEach(this.convertibleFiles, (filePath: string, index: number) => {
+                Row() {
+                  Text(filePath.substring(filePath.lastIndexOf('/') + 1))
+                    .fontSize(13)
+                    .fontColor($r('app.color.text_primary'))
+                }
+                .width('100%')
+                .padding(8)
+                .backgroundColor(index % 2 === 0 ? Color.White : '#F5F5F5')
+              })
+            }
+          }
+          .width('100%')
+          .height(200)
+          .margin({ top: 8, bottom: 8 })
+
+          // Progress
+          if (this.isConvertingOffice) {
+            Row() {
+              Text('转换进度:')
+                .fontSize(14)
+                .fontColor($r('app.color.text_secondary'))
+
+              Text(`${this.officeConversionPercent}%`)
+                .fontSize(14)
+                .fontColor('#2196F3')
+            }
+            .width('100%')
+            .padding(8)
+
+            Progress({ value: this.officeConversionPercent, total: 100, type: ProgressType.Linear })
+              .width('100%')
+              .margin({ top: 4 })
+          }
+
+          // Result
+          if (this.officeConversionResult) {
+            Text(this.officeConversionResult)
+              .fontSize(14)
+              .fontColor('#4CAF50')
+              .margin({ top: 8 })
+          }
+
+          if (this.officeConversionError) {
+            Text(this.officeConversionError)
+              .fontSize(12)
+              .fontColor('#F44336')
+              .margin({ top: 8 })
+          }
+        }
+      }
+      .width('100%')
+      .padding(16)
+      .backgroundColor($r('app.color.page_background'))
+
+      Divider().color('#E0E0E0')
+
+      // Buttons
+      Row() {
+        Button('取消')
+          .fontSize(14)
+          .backgroundColor('#E0E0E0')
+          .fontColor($r('app.color.text_primary'))
+          .onClick(() => { this.showOfficeConvertDialog = false; })
+
+        Button('开始转换')
+          .fontSize(14)
+          .backgroundColor('#2196F3')
+          .fontColor(Color.White)
+          .enabled(!this.isConvertingOffice && this.convertibleFiles.length > 0)
+          .onClick(() => { this.startOfficeConversion(); })
+      }
+      .width('100%')
+      .padding(16)
+      .justifyContent(FlexAlign.End)
+      .backgroundColor(Color.White)
+    }
+    .width(320)
+    .backgroundColor(Color.White)
+    .borderRadius(8)
   }
 
   // ----------- System Data Page -----------
@@ -3744,6 +4122,60 @@ struct Index {
         .backgroundColor($r('app.color.surface'))
         .borderRadius(12)
         .padding(8)
+      } else if (this.selectedFile && this.isMarkdownFile(this.selectedFile.type) && this.markdownFileContentBase64) {
+        // Markdown file preview - use Web component
+        Column() {
+          Text(this.previewContent || 'Markdown文档')
+            .fontSize(14)
+            .fontColor($r('app.color.text_secondary'))
+            .textAlign(TextAlign.Start)
+            .width('100%')
+
+          if (this.markdownPreviewError) {
+            Text(this.markdownPreviewError)
+              .fontSize(13)
+              .fontColor('#F44336')
+              .margin({ top: 8 })
+          }
+
+          // Web component for Markdown preview
+          Web({ src: $rawfile('markdown_preview.html'), controller: this.markdownWebController })
+            .width('100%')
+            .height(400)
+            .backgroundColor(Color.White)
+            .borderRadius(8)
+            .margin({ top: 12 })
+            .onPageEnd(() => {
+              console.info('[Index] Markdown Web page loaded, ready to send content');
+              this.markdownWebReady = true;
+              // Send file content after Web is ready
+              if (this.markdownFileContentBase64) {
+                setTimeout(() => {
+                  this.sendMarkdownFileToWeb();
+                }, 100);
+              }
+            })
+            .javaScriptAccess(true)
+            .domStorageAccess(true)
+
+          // Button to open with system app
+          Button('用系统应用打开')
+            .fontSize(14)
+            .fontColor(Color.White)
+            .backgroundColor($r('app.color.primary'))
+            .borderRadius(8)
+            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .margin({ top: 16 })
+            .onClick(() => {
+              if (this.selectedFile) {
+                this.openDocumentWithSystem(this.selectedFile);
+              }
+            })
+        }
+        .width('100%')
+        .backgroundColor($r('app.color.surface'))
+        .borderRadius(12)
+        .padding(16)
       } else if (this.selectedFile && this.isTextFile(this.selectedFile.type) && this.previewTextContent) {
         // Text file preview
         Column() {
@@ -4116,83 +4548,6 @@ struct Index {
           .margin({ top: 8 })
         }
 
-        // 编码器状态
-        this.SettingsSectionHeader('编码器状态')
-
-        Column() {
-          Row() {
-            Text('当前编码器:')
-              .fontSize(14)
-              .fontColor($r('app.color.text_secondary'))
-            Text(this.encoderStatus)
-              .fontSize(14)
-              .fontColor(this.isOfflineMode ? '#4CAF50' : '#2196F3')
-              .margin({ left: 8 })
-              .layoutWeight(1)
-          }
-
-          Row() {
-            Text('MindSpore Lite:')
-              .fontSize(14)
-              .fontColor($r('app.color.text_secondary'))
-              .margin({ top: 8 })
-            Circle({ width: 8, height: 8 })
-              .fill(this.isOfflineMode ? '#4CAF50' : '#9E9E9E')
-              .margin({ left: 8, top: 8 })
-            Text(this.isOfflineMode ? '可用' : '不可用')
-              .fontSize(14)
-              .fontColor(this.isOfflineMode ? '#4CAF50' : '#9E9E9E')
-              .margin({ left: 4, top: 8 })
-          }
-
-          Column() {
-            Text('选择编码器:')
-              .fontSize(14)
-              .fontColor($r('app.color.text_secondary'))
-              .margin({ top: 16 })
-
-            Row() {
-              Button('MindSpore')
-                .fontSize(12)
-                .height(32)
-                .backgroundColor(this.preferredEncoder === 'mindspore' ? '#4CAF50' : '#E0E0E0')
-                .fontColor(this.preferredEncoder === 'mindspore' ? '#FFFFFF' : '#333333')
-                .onClick(() => {
-                  this.preferredEncoder = 'mindspore';
-                  this.updateEncoderPreference();
-                })
-
-              Button('后端API')
-                .fontSize(12)
-                .height(32)
-                .margin({ left: 8 })
-                .backgroundColor(this.preferredEncoder === 'api' ? '#2196F3' : '#E0E0E0')
-                .fontColor(this.preferredEncoder === 'api' ? '#FFFFFF' : '#333333')
-                .onClick(() => {
-                  this.preferredEncoder = 'api';
-                  this.updateEncoderPreference();
-                })
-
-              Button('本地')
-                .fontSize(12)
-                .height(32)
-                .margin({ left: 8 })
-                .backgroundColor(this.preferredEncoder === 'local' ? '#FF9800' : '#E0E0E0')
-                .fontColor(this.preferredEncoder === 'local' ? '#FFFFFF' : '#333333')
-                .onClick(() => {
-                  this.preferredEncoder = 'local';
-                  this.updateEncoderPreference();
-                })
-            }
-            .margin({ top: 8 })
-          }
-        }
-        .width('100%')
-        .padding(16)
-        .backgroundColor($r('app.color.surface'))
-        .borderRadius(12)
-        .margin({ top: 8 })
-
         // 解析模式设置（与Python一致）
         this.SettingsSectionHeader('解析模式设置')
 
@@ -4370,6 +4725,163 @@ struct Index {
             .fontSize(12)
             .fontColor($r('app.color.text_hint'))
             .margin({ top: 8 })
+
+          // 嵌入方法选择
+          Row() {
+            Column() {
+              Text('向量化方法')
+                .fontSize(16)
+                .fontColor($r('app.color.text_primary'))
+              Text('选择文本向量化的实现方式')
+                .fontSize(12)
+                .fontColor($r('app.color.text_hint'))
+                .margin({ top: 4 })
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+          }
+          .width('100%')
+
+          Row() {
+            Column() {
+              Text('MindSpore')
+                .fontSize(14)
+                .fontWeight(this.embeddingMethod === 'mindspore' ? FontWeight.Bold : FontWeight.Normal)
+                .fontColor(this.embeddingMethod === 'mindspore' ? $r('app.color.primary') : $r('app.color.text_secondary'))
+              Row() {
+                Text('端侧模型推理')
+                  .fontSize(11)
+                  .fontColor($r('app.color.text_hint'))
+                if (this.isOfflineMode) {
+                  Circle({ width: 6, height: 6 })
+                    .fill('#4CAF50')
+                    .margin({ left: 4 })
+                  Text('可用')
+                    .fontSize(10)
+                    .fontColor('#4CAF50')
+                }
+              }
+              .margin({ top: 2 })
+            }
+            .padding(12)
+            .borderRadius(8)
+            .backgroundColor(this.embeddingMethod === 'mindspore' ? '#E3F2FD' : '#F5F5F5')
+            .borderWidth(this.embeddingMethod === 'mindspore' ? 2 : 0)
+            .borderColor($r('app.color.primary'))
+            .onClick(() => {
+              this.embeddingMethod = 'mindspore';
+              if (this.semanticRep) {
+                this.semanticRep.setEmbeddingMethod('mindspore');
+              }
+              this.saveAllSettings();
+            })
+            .margin({ right: 8 })
+
+            Column() {
+              Text('原生API')
+                .fontSize(14)
+                .fontWeight(this.embeddingMethod === 'native' ? FontWeight.Bold : FontWeight.Normal)
+                .fontColor(this.embeddingMethod === 'native' ? $r('app.color.primary') : $r('app.color.text_secondary'))
+              Text('AIP嵌入接口')
+                .fontSize(11)
+                .fontColor($r('app.color.text_hint'))
+                .margin({ top: 2 })
+            }
+            .padding(12)
+            .borderRadius(8)
+            .backgroundColor(this.embeddingMethod === 'native' ? '#E3F2FD' : '#F5F5F5')
+            .borderWidth(this.embeddingMethod === 'native' ? 2 : 0)
+            .borderColor($r('app.color.primary'))
+            .onClick(() => {
+              this.embeddingMethod = 'native';
+              if (this.semanticRep) {
+                this.semanticRep.setEmbeddingMethod('native');
+              }
+              this.saveAllSettings();
+            })
+            .margin({ right: 8 })
+
+            Column() {
+              Text('本地哈希')
+                .fontSize(14)
+                .fontWeight(this.embeddingMethod === 'local' ? FontWeight.Bold : FontWeight.Normal)
+                .fontColor(this.embeddingMethod === 'local' ? $r('app.color.primary') : $r('app.color.text_secondary'))
+              Text('快速但精度低')
+                .fontSize(11)
+                .fontColor($r('app.color.text_hint'))
+                .margin({ top: 2 })
+            }
+            .padding(12)
+            .borderRadius(8)
+            .backgroundColor(this.embeddingMethod === 'local' ? '#E3F2FD' : '#F5F5F5')
+            .borderWidth(this.embeddingMethod === 'local' ? 2 : 0)
+            .borderColor($r('app.color.primary'))
+            .onClick(() => {
+              this.embeddingMethod = 'local';
+              if (this.semanticRep) {
+                this.semanticRep.setEmbeddingMethod('local');
+              }
+              this.saveAllSettings();
+            })
+            .margin({ right: 8 })
+
+            Column() {
+              Text('后端API')
+                .fontSize(14)
+                .fontWeight(this.embeddingMethod === 'api' ? FontWeight.Bold : FontWeight.Normal)
+                .fontColor(this.embeddingMethod === 'api' ? $r('app.color.primary') : $r('app.color.text_secondary'))
+              Row() {
+                Text('需服务端支持')
+                  .fontSize(11)
+                  .fontColor($r('app.color.text_hint'))
+                if (this.useServer && this.connectionStatus === '连接正常') {
+                  Circle({ width: 6, height: 6 })
+                    .fill('#4CAF50')
+                    .margin({ left: 4 })
+                  Text('已连接')
+                    .fontSize(10)
+                    .fontColor('#4CAF50')
+                }
+              }
+              .margin({ top: 2 })
+            }
+            .padding(12)
+            .borderRadius(8)
+            .backgroundColor(this.embeddingMethod === 'api' ? '#E3F2FD' : '#F5F5F5')
+            .borderWidth(this.embeddingMethod === 'api' ? 2 : 0)
+            .borderColor($r('app.color.primary'))
+            .onClick(() => {
+              this.embeddingMethod = 'api';
+              if (this.semanticRep) {
+                this.semanticRep.setEmbeddingMethod('api');
+              }
+              this.saveAllSettings();
+            })
+          }
+          .width('100%')
+          .margin({ top: 12 })
+
+          if (this.embeddingMethod === 'native') {
+            Text('原生API：使用HarmonyOS NEXT的AIP嵌入接口（API 15+，仅2in1设备）')
+              .fontSize(12)
+              .fontColor('#4CAF50')
+              .margin({ top: 8 })
+          } else if (this.embeddingMethod === 'mindspore') {
+            Text('MindSpore：使用端侧模型进行向量推理')
+              .fontSize(12)
+              .fontColor('#4CAF50')
+              .margin({ top: 8 })
+          } else if (this.embeddingMethod === 'local') {
+            Text('本地哈希：基于文本特征的快速哈希向量化，精度较低')
+              .fontSize(12)
+              .fontColor('#FF9800')
+              .margin({ top: 8 })
+          } else {
+            Text('后端API：需要后端服务提供向量化接口')
+              .fontSize(12)
+              .fontColor('#2196F3')
+              .margin({ top: 8 })
+          }
         }
         .width('100%')
         .padding(16)
