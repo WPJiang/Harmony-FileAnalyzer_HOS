@@ -2249,10 +2249,26 @@ struct WW8_TCellVer8 {
  *   bVertRestart : 1 (bit 6) - first cell of vertical merge range
  */
 struct WW8_TCell {
-    uint8_t bFirstMerged;   // bit 0 of aBits1Ver8
-    uint8_t bMerged;        // bit 1 of aBits1Ver8
-    uint8_t bVertMerge;     // bit 5 of aBits1Ver8
-    uint8_t bVertRestart;   // bit 6 of aBits1Ver8
+    // Merge flags (from aBits1Ver8)
+    uint8_t bFirstMerged;   // bit 0 - first cell of horizontal merge
+    uint8_t bMerged;        // bit 1 - merged with preceding cell
+    uint8_t bVertMerge;     // bit 5 - vertically merged
+    uint8_t bVertRestart;   // bit 6 - first cell of vertical merge
+
+    // Additional flags
+    uint8_t bVertical;      // bit 2 - vertical text flow
+    uint8_t bBackward;      // bit 3 - bottom-to-top for vertical
+    uint8_t nVertAlign;     // bits 7-8 (shifted) - 0=top, 1=center, 2=bottom
+
+    // Borders (4 bytes each, from rgbrcVer8)
+    // Format: [dptLineWidth, brcType, ico, dptSpace+flags]
+    uint8_t brcTop[4];
+    uint8_t brcLeft[4];
+    uint8_t brcBottom[4];
+    uint8_t brcRight[4];
+
+    // Shading (from sprmTDefTableShd or sprmTDefTableNewShd)
+    uint16_t shdBits;       // fore/back/style packed
 };
 
 /**
