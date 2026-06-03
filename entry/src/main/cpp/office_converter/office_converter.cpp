@@ -1698,6 +1698,62 @@ static std::string xmlEscape(const std::string& text) {
 }
 
 /**
+ * Convert WW8_SHD shading to OOXML w:shd element
+ * SHD bits: nFore (bits 0-4), nBack (bits 5-9), nStyle (bits 10-15)
+ */
+static std::string shdToXml(uint16_t shdBits) {
+    if (shdBits == 0) return "";
+
+    // Extract colors and style
+    uint8_t nFore = shdBits & 0x1F;      // bits 0-4
+    uint8_t nBack = (shdBits >> 5) & 0x1F;  // bits 5-9
+    uint8_t nStyle = (shdBits >> 10) & 0x3F; // bits 10-15
+
+    // Basic color index mapping for fill (background)
+    const char* colors[] = {"auto", "000000", "0000FF", "00FF00", "FF0000",
+                            "FFFF00", "FF00FF", "00FFFF", "FFFFFF", "auto",
+                            "auto", "auto", "auto", "auto", "auto", "auto", "auto", "auto"};
+
+    std::string fill = (nBack < 18) ? colors[nBack] : "auto";
+
+    // Style: 0=clear, 1=solid, etc.
+    const char* style = (nStyle == 0) ? "clear" : "solid";
+
+    return "<w:shd w:val=\"" + std::string(style) + "\" w:fill=\"" + fill + "\"/>";
+}
+
+/**
+ * Convert WW8_BRC border to OOXML w:tcBorders element
+ * Border format: [dptLineWidth, brcType, ico, dptSpace+flags]
+ * OOXML: w:val (single/double/etc), w:sz (1/8pt * 8 = eighths), w:color (hex or auto)
+ */
+static std::string borderToXml(const char* side, const uint8_t* brc) {
+    if (brc[0] == 0 && brc[1] == 0) return "";  // No border
+
+    // brcType: 0=none, 1=single, 2=thick, 3=double, etc.
+    const char* types[] = {"none", "single", "thick", "double",
+                           "dotted", "dashed", "nil", "nil", "nil", "nil"};
+    const char* type = (brc[1] < 10) ? types[brc[1]] : "single";
+
+    // dptLineWidth is in 1/8pt, OOXML w:sz is in 1/8pt (eighths of a point)
+    int sz = brc[0] * 8;  // Convert to eighths
+
+    // ico is color index (1-17), for simplicity use "auto" or map to hex
+    std::string color = "auto";
+    if (brc[2] > 0 && brc[2] <= 17) {
+        // Basic color mapping (MS-DOC color indices)
+        const char* colors[] = {"auto", "000000", "0000FF", "00FF00", "FF0000",
+                                "FFFF00", "FF00FF", "00FFFF", "FFFFFF", "auto",
+                                "auto", "auto", "auto", "auto", "auto", "auto", "auto", "auto"};
+        color = colors[brc[2]];
+    }
+
+    return std::string("<w:") + side + " w:val=\"" + type +
+           "\" w:sz=\"" + std::to_string(sz) +
+           "\" w:color=\"" + color + "\"/>";
+}
+
+/**
  * Parse the FIB (File Information Block) from the WordDocument stream
  * to locate the Piece Table (CLX) in the Table stream.
  *
@@ -2349,17 +2405,31 @@ static TtpRowInfo parseTDefTableRowInfo(const std::vector<uint8_t>& operand) {
     info.cells.reserve(n);
     for (uint8_t c = 0; c < n; c++) {
         // WW8_TCellVer8 starts at rgTc80Off + c * 20
+        // Layout: [0..1]=aBits1Ver8, [2..3]=aUnused, [4..19]=rgbrcVer8[4]
         const uint8_t* pTc80 = &operand[rgTc80Off + c * 20];
 
         // aBits1Ver8 is SVBT16 at offset 0
         uint16_t aBits1 = SVBT16ToUInt16(pTc80);
 
         WW8_TCell cell;
-        // LibreOffice ww8par2.cxx:1170-1176
+        // LibreOffice ww8par2.cxx:1170-1177
         cell.bFirstMerged = (uint8_t)((aBits1 & 0x0001) != 0);
         cell.bMerged      = (uint8_t)((aBits1 & 0x0002) != 0);
+        cell.bVertical    = (uint8_t)((aBits1 & 0x0004) != 0);
+        cell.bBackward    = (uint8_t)((aBits1 & 0x0008) != 0);
         cell.bVertMerge   = (uint8_t)((aBits1 & 0x0020) != 0);
         cell.bVertRestart = (uint8_t)((aBits1 & 0x0040) != 0);
+        cell.nVertAlign   = (uint8_t)((aBits1 & 0x0180) >> 7);  // bits 7-8
+
+        // Extract borders from rgbrcVer8 (ww8struc.hxx:574-580)
+        // Each border is 4 bytes: [dptLineWidth, brcType, ico, dptSpace+flags]
+        // rgbrcVer8[0] = top (offset 4-7), [1] = left (8-11), [2] = bot (12-15), [3] = right (16-19)
+        memcpy(cell.brcTop,    pTc80 + 4,  4);
+        memcpy(cell.brcLeft,   pTc80 + 8,  4);
+        memcpy(cell.brcBottom, pTc80 + 12, 4);
+        memcpy(cell.brcRight,  pTc80 + 16, 4);
+
+        cell.shdBits = 0;  // Shading parsed separately via sprmTDefTableShd
 
         info.cells.push_back(cell);
     }
@@ -2368,13 +2438,16 @@ static TtpRowInfo parseTDefTableRowInfo(const std::vector<uint8_t>& operand) {
     {
         std::string dump;
         for (uint8_t c = 0; c < n && c < 8; c++) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "[%u]:FM=%d M=%d VM=%d VR=%d",
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[%u]:FM=%d M=%d VM=%d VR=%d V=%d B=%d VA=%d",
                      (unsigned)c,
                      (int)info.cells[c].bFirstMerged,
                      (int)info.cells[c].bMerged,
                      (int)info.cells[c].bVertMerge,
-                     (int)info.cells[c].bVertRestart);
+                     (int)info.cells[c].bVertRestart,
+                     (int)info.cells[c].bVertical,
+                     (int)info.cells[c].bBackward,
+                     (int)info.cells[c].nVertAlign);
             if (!dump.empty()) dump += " ";
             dump += buf;
         }
@@ -2396,6 +2469,32 @@ static TtpRowInfo parseTDefTableRowInfo(const std::vector<uint8_t>& operand) {
     }
 
     return info;
+}
+
+/**
+ * Parse sprmTDefTableShd / sprmTDefTableNewShd for cell shading
+ * LibreOffice WW8_SHD structure (ww8struc.hxx:582-618):
+ *   nFore (5 bits)  = bits 0-4 (0x001F) - foreground color
+ *   nBack (5 bits)  = bits 5-9 (0x03E0) - background color
+ *   nStyle (6 bits) = bits 10-15 (0x7C00 for Ver8) - fill pattern
+ */
+static std::vector<uint16_t> parseTDefTableShd(const std::vector<uint8_t>& operand) {
+    std::vector<uint16_t> shdBits;
+
+    if (operand.size() < 2) return shdBits;
+
+    // sprmTDefTableShd operand: nCols (1 byte) + n * 2 bytes (SHD entries)
+    uint8_t nCols = operand[0];
+    if (nCols == 0 || nCols > 63) return shdBits;
+
+    if (operand.size() < 1 + nCols * 2) return shdBits;
+
+    for (uint8_t c = 0; c < nCols; c++) {
+        uint16_t shd = SVBT16ToUInt16(&operand[1 + c * 2]);
+        shdBits.push_back(shd);
+    }
+
+    return shdBits;
 }
 
 /**
@@ -3975,15 +4074,18 @@ static std::vector<DocContentElement> extractDocContent(
                     std::vector<DocTableCell> row;
                     int cellIdx = 0;
                     for (int k = prevTtp + 1; k < ttpIdx; k++, cellIdx++) {
-                        // LibreOffice bMerged (bit 1): cell merged with preceding cell
-                        // bFirstMerged (bit 0): first cell of merge range (NOT continuation)
+                        // Use LibreOffice flags directly
+                        const WW8_TCell* pTc = (rowInfo && cellIdx < (int)rowInfo->cells.size())
+                                        ? &rowInfo->cells[cellIdx] : nullptr;
+
+                        // bMerged=1 means this cell is continuation of preceding cell
+                        // (LibreOffice WW8_TCell.bMerged, ww8struc.hxx:532)
                         bool isContinuation = false;
-                        if (rowInfo && cellIdx < (int)rowInfo->cells.size()) {
-                            // LibreOffice WW8_TCell.bMerged == 1 means continuation
-                            if (rowInfo->cells[cellIdx].bMerged == 1) {
-                                isContinuation = true;
-                            }
+                        if (pTc && pTc->bMerged == 1) {
+                            isContinuation = true;
                         }
+
+                        // Check horizontal merge ranges from sprmTMerge (fallback)
                         if (!isContinuation && !mergeRanges.empty()) {
                             for (const auto& mr : mergeRanges) {
                                 if (cellIdx >= mr.itcFirst && cellIdx < mr.itcLim) {
@@ -3994,14 +4096,34 @@ static std::vector<DocContentElement> extractDocContent(
                         }
 
                         if (isContinuation && !row.empty()) {
+                            // Merge with preceding cell: increment gridSpan
                             row.back().colSpan += 1;
                             if (!cells[k].text.empty()) {
                                 row.back().text += (row.back().text.empty() ? "" : "\n") + cells[k].text;
                             }
                         } else {
+                            // New cell (not merged)
                             DocTableCell tc;
                             tc.text = cells[k].text;
+
+                            // Calculate gridSpan from rgdxaCenter
                             tc.colSpan = (cellIdx < (int)cellSpan.size()) ? cellSpan[cellIdx] : 1;
+
+                            // Copy borders and properties from WW8_TCell
+                            if (pTc) {
+                                memcpy(tc.brcTop, pTc->brcTop, 4);
+                                memcpy(tc.brcLeft, pTc->brcLeft, 4);
+                                memcpy(tc.brcBottom, pTc->brcBottom, 4);
+                                memcpy(tc.brcRight, pTc->brcRight, 4);
+                                tc.shdBits = pTc->shdBits;
+                                tc.textDirection = pTc->bVertical ? (pTc->bBackward ? 2 : 1) : 0;
+                                tc.vertAlign = pTc->nVertAlign;
+
+                                // Vertical merge flags
+                                tc.vMergeRestart = (pTc->bVertMerge == 1 && pTc->bVertRestart == 1);
+                                tc.vMergeContinue = (pTc->bVertMerge == 1 && pTc->bVertRestart == 0);
+                            }
+
                             row.push_back(tc);
                         }
                     }
@@ -4509,11 +4631,43 @@ bool OfficeConverter::convertDOC(const std::string& inputPath, const std::string
                     int span = row.cells[c].colSpan;
                     if (span < 1) span = 1;
 
-                    // Build tcPr with optional gridSpan
+                    // Build tcPr with optional gridSpan, vMerge, borders
                     std::string tcPr = "<w:tcPr>";
                     if (span > 1) {
                         tcPr += "<w:gridSpan w:val=\"" + std::to_string(span) + "\"/>";
                     }
+                    if (row.cells[c].vMergeRestart) {
+                        tcPr += "<w:vMerge w:val=\"restart\"/>";
+                    } else if (row.cells[c].vMergeContinue) {
+                        tcPr += "<w:vMerge w:val=\"continue\"/>";
+                    }
+                    if (row.cells[c].vertAlign > 0) {
+                        const char* valign[] = {"top", "center", "bottom"};
+                        tcPr += "<w:vAlign w:val=\"" + std::string(valign[row.cells[c].vertAlign]) + "\"/>";
+                    }
+
+                    // Cell borders
+                    std::string borders;
+                    borders += borderToXml("top", row.cells[c].brcTop);
+                    borders += borderToXml("left", row.cells[c].brcLeft);
+                    borders += borderToXml("bottom", row.cells[c].brcBottom);
+                    borders += borderToXml("right", row.cells[c].brcRight);
+                    if (!borders.empty()) {
+                        tcPr += "<w:tcBorders>" + borders + "</w:tcBorders>";
+                    }
+
+                    // Shading
+                    std::string shading = shdToXml(row.cells[c].shdBits);
+                    if (!shading.empty()) {
+                        tcPr += shading;
+                    }
+
+                    // Text direction for vertical cells
+                    if (row.cells[c].textDirection > 0) {
+                        const char* dirs[] = {"lrTb", "tbRl", "btLr"};
+                        tcPr += "<w:textDirection w:val=\"" + std::string(dirs[row.cells[c].textDirection]) + "\"/>";
+                    }
+
                     tcPr += "<w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr>";
 
                     // Handle multi-line cell text (\n → separate <w:p> elements)
