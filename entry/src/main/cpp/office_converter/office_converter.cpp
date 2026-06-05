@@ -13,6 +13,12 @@
 #include <hilog/log.h>
 #include <zlib.h>
 
+// Working DOC conversion headers (from test/doc_to_docx)
+#include "ww8_structs.hpp"
+#include "ole2_parser.hpp"
+#include "ww8_table_parser.hpp"
+#include "docx_writer.hpp"
+
 // Define logging domain and tag for this module
 #undef LOG_DOMAIN
 #undef LOG_TAG
@@ -1685,6 +1691,11 @@ static std::string xmlEscape(const std::string& text) {
     std::string result;
     result.reserve(text.size());
     for (char c : text) {
+        // Filter out invalid XML 1.0 control characters
+        // XML 1.0 only allows: 0x09 (tab), 0x0A (LF), 0x0D (CR)
+        if (c >= 0x00 && c < 0x20 && c != 0x09 && c != 0x0A && c != 0x0D) {
+            continue;  // Skip invalid control characters
+        }
         switch (c) {
             case '&':  result += "&amp;"; break;
             case '<':  result += "&lt;"; break;
@@ -2283,28 +2294,31 @@ static std::vector<PlcBtePapxEntry> scanWordDocForFkpPages(const uint8_t* wordDo
 // SVBT16: little-endian 16-bit value, read as: val = bytes[0] | (bytes[1] << 8)
 #define SVBT16ToUInt16(p) ((uint16_t)((p)[0] | ((p)[1] << 8)))
 
+// SVBT32: little-endian 32-bit value
+#define SVBT32ToUInt32(p) ((uint32_t)((p)[0] | ((p)[1] << 8) | ((p)[2] << 16) | ((p)[3] << 24)))
+
 /**
- * WW8_TCellVer8 - TC80 structure as read from file (ww8struc.hxx:574-580)
+ * OldWW8_TCellVer8 - TC80 structure as read from file (ww8struc.hxx:574-580)
  * Each TC80 is 20 bytes:
  *   [0..1]  aBits1Ver8 (SVBT16) - TCGRF flags
  *   [2..3]  aUnused - reserved
  *   [4..19] rgbrcVer8[4] - 4 border codes (each 4 bytes, we skip borders)
  */
-struct WW8_TCellVer8 {
+struct OldWW8_TCellVer8 {
     uint8_t aBits1Ver8[2];   // SVBT16, little-endian
     uint8_t aUnused[2];      // reserved
     uint8_t rgbrcVer8[16];   // 4 * 4 bytes border codes (ignored for gridSpan)
 };
 
 /**
- * WW8_TCell - Working structure for cell properties (ww8struc.hxx:526-555)
+ * OldWW8_TCell - Working structure for cell properties (ww8struc.hxx:526-555)
  * Bit field definitions from LibreOffice:
  *   bFirstMerged : 1 (bit 0) - first cell of horizontal merge range
  *   bMerged : 1 (bit 1) - merged with preceding cell (continuation)
  *   bVertMerge : 1 (bit 5) - vertically merged with cell above
  *   bVertRestart : 1 (bit 6) - first cell of vertical merge range
  */
-struct WW8_TCell {
+struct OldWW8_TCell {
     // Merge flags (from aBits1Ver8)
     uint8_t bFirstMerged;   // bit 0 - first cell of horizontal merge
     uint8_t bMerged;        // bit 1 - merged with preceding cell
@@ -2331,7 +2345,7 @@ struct WW8_TCell {
  * TtpRowInfo - Row geometry from sprmTDefTable for gridSpan/vMerge output
  */
 struct TtpRowInfo {
-    std::vector<WW8_TCell> cells;      // Per-cell properties from TC80
+    std::vector<OldWW8_TCell> cells;      // Per-cell properties from TC80
     std::vector<uint16_t> rgdxaCenter; // n+1 column boundary entries
     uint8_t nCols = 0;
 };
@@ -2411,7 +2425,7 @@ static TtpRowInfo parseTDefTableRowInfo(const std::vector<uint8_t>& operand) {
         // aBits1Ver8 is SVBT16 at offset 0
         uint16_t aBits1 = SVBT16ToUInt16(pTc80);
 
-        WW8_TCell cell;
+        OldWW8_TCell cell;
         // LibreOffice ww8par2.cxx:1170-1177
         cell.bFirstMerged = (uint8_t)((aBits1 & 0x0001) != 0);
         cell.bMerged      = (uint8_t)((aBits1 & 0x0002) != 0);
@@ -2495,6 +2509,1454 @@ static std::vector<uint16_t> parseTDefTableShd(const std::vector<uint8_t>& opera
     }
 
     return shdBits;
+}
+
+// ============================================================================
+// VERIFIED DOC TABLE DETECTION - From test/ww8_table_parser.hpp
+// ============================================================================
+// This section contains verified table detection logic ported from LibreOffice.
+
+// Verified FkpPapxEntry - preserves origFcEnd for phantom entry handling
+struct VerifiedFkpPapxEntry {
+    uint32_t fcStart;
+    uint32_t fcEnd;
+    uint32_t origFcEnd;      // Original fcEnd before truncation
+    std::vector<uint8_t> grpprl;
+};
+
+// Verified: Decode SPRM header
+inline void verifiedDecodeSprmId(uint16_t sprmId, uint16_t& ispmd, uint8_t& fSpec,
+                                  uint8_t& sgc, uint8_t& spra) {
+    ispmd = sprmId & 0x01FF;
+    fSpec = (sprmId >> 9) & 0x01;
+    sgc = (sprmId >> 10) & 0x07;
+    spra = (sprmId >> 13) & 0x07;
+}
+
+// Verified: Get operand size from spra
+inline int verifiedGetSprmOperandSize(uint8_t spra, const uint8_t* data, size_t remaining) {
+    switch (spra) {
+        case 0: case 1: return 1;
+        case 2: case 4: case 5: return 2;
+        case 3: return 4;
+        case 7: return 3;
+        case 6: // Variable length
+            if (remaining < 1) return -1;
+            return data[0] + 1;
+        default: return -1;
+    }
+}
+
+// Verified: Parse single SPRM from grpprl
+struct VerifiedSprmResult {
+    uint16_t sprmId;
+    uint16_t ispmd;
+    uint8_t sgc;
+    std::vector<uint8_t> operand;
+    bool valid;
+    VerifiedSprmResult() : sprmId(0), ispmd(0), sgc(0), valid(false) {}
+};
+
+inline VerifiedSprmResult verifiedParseSprm(const uint8_t* grpprl, size_t grpprlLen, size_t& pos) {
+    VerifiedSprmResult result;
+    if (pos + 2 > grpprlLen) return result;
+
+    uint16_t sprmId = SVBT16ToUInt16(grpprl + pos);
+    result.sprmId = sprmId;
+    uint8_t fSpec, spra;
+    verifiedDecodeSprmId(sprmId, result.ispmd, fSpec, result.sgc, spra);
+    pos += 2;
+
+    int opSize = verifiedGetSprmOperandSize(spra, grpprl + pos, grpprlLen - pos);
+    if (opSize < 0 || pos + opSize > grpprlLen) return result;
+
+    result.operand.assign(grpprl + pos, grpprl + pos + opSize);
+    pos += opSize;
+    result.valid = true;
+    return result;
+}
+
+// Verified: Find specific SPRM by full ID
+inline bool verifiedFindSprm(const uint8_t* grpprl, size_t grpprlLen, uint16_t targetSprmId,
+                              std::vector<uint8_t>& operand) {
+    size_t pos = 0;
+    while (pos < grpprlLen) {
+        VerifiedSprmResult sprm = verifiedParseSprm(grpprl, grpprlLen, pos);
+        if (!sprm.valid) break;
+        if (sprm.sprmId == targetSprmId) {
+            operand = sprm.operand;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Verified: Find SPRM by ispmd and sgc
+inline bool verifiedFindSprmByGroup(const uint8_t* grpprl, size_t grpprlLen,
+                                     uint16_t ispmd, uint8_t sgc,
+                                     std::vector<uint8_t>& operand) {
+    size_t pos = 0;
+    while (pos < grpprlLen) {
+        VerifiedSprmResult sprm = verifiedParseSprm(grpprl, grpprlLen, pos);
+        if (!sprm.valid) break;
+        if (sprm.ispmd == ispmd && sprm.sgc == sgc) {
+            operand = sprm.operand;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Verified: hasTabCellSprm - checks sprmPFInnerTableCell (0x244B) then sprmPFInTable (0x2416)
+inline int verifiedHasTabCellSprm(const uint8_t* grpprl, size_t grpprlLen) {
+    std::vector<uint8_t> operand;
+    if (verifiedFindSprm(grpprl, grpprlLen, 0x244B, operand)) {
+        if (operand.size() >= 1 && operand[0] == 1) return 1;
+    }
+    if (verifiedFindSprm(grpprl, grpprlLen, 0x2416, operand)) {
+        if (operand.size() >= 1 && operand[0] == 1) return 1;
+    }
+    return 0;
+}
+
+// Verified: isTtpMark - checks sprmPFTtp (0x2417)
+inline bool verifiedIsTtpMark(const uint8_t* grpprl, size_t grpprlLen) {
+    std::vector<uint8_t> operand;
+    if (verifiedFindSprm(grpprl, grpprlLen, 0x2417, operand)) {
+        return operand.size() >= 1 && operand[0] == 1;
+    }
+    return false;
+}
+
+// Verified: parseTDefTable - extracts TC80 cells
+inline bool verifiedParseTDefTable(const uint8_t* operand, size_t operandLen, TtpRowInfo& info) {
+    if (operandLen < 3) return false;
+
+    size_t dataOff = 0;
+    if (operandLen >= 4 && operand[0] > 63) {
+        if (operandLen >= 3 && operand[2] > 0 && operand[2] <= 63) dataOff = 2;
+        else if (operandLen >= 2 && operand[1] > 0 && operand[1] <= 63) dataOff = 1;
+    }
+
+    if (operandLen < dataOff + 1) return false;
+    uint8_t n = operand[dataOff];
+    if (n == 0 || n > 63) return false;
+
+    size_t rgdxaCenterOff = dataOff + 1;
+    size_t rgTc80Off = rgdxaCenterOff + (size_t)(n + 1) * 2;
+    size_t needed = rgTc80Off + (size_t)n * 20;
+
+    if (operandLen < needed) {
+        if (operandLen >= rgdxaCenterOff + (n + 1) * 2) {
+            info.nCols = n;
+            info.rgdxaCenter.reserve(n + 1);
+            for (uint8_t c = 0; c <= n; c++) {
+                info.rgdxaCenter.push_back(SVBT16ToUInt16(&operand[rgdxaCenterOff + c * 2]));
+            }
+        }
+        return false;
+    }
+
+    info.nCols = n;
+    info.rgdxaCenter.reserve(n + 1);
+    for (uint8_t c = 0; c <= n; c++) {
+        info.rgdxaCenter.push_back(SVBT16ToUInt16(&operand[rgdxaCenterOff + c * 2]));
+    }
+
+    info.cells.reserve(n);
+    for (uint8_t c = 0; c < n; c++) {
+        const uint8_t* pTc80 = &operand[rgTc80Off + c * 20];
+        uint16_t aBits1 = SVBT16ToUInt16(pTc80);
+
+        OldWW8_TCell cell;
+        cell.bFirstMerged = (aBits1 & 0x0001) != 0;
+        cell.bMerged      = (aBits1 & 0x0002) != 0;
+        cell.bVertical    = (aBits1 & 0x0004) != 0;
+        cell.bBackward    = (aBits1 & 0x0008) != 0;
+        cell.bVertMerge   = (aBits1 & 0x0020) != 0;
+        cell.bVertRestart = (aBits1 & 0x0040) != 0;
+        cell.nVertAlign   = (aBits1 & 0x0180) >> 7;
+        info.cells.push_back(cell);
+    }
+    return true;
+}
+
+// Verified: parsePapxFkp - extracts PAPX entries from 512-byte FKP page
+static std::vector<VerifiedFkpPapxEntry> verifiedParsePapxFkp(const uint8_t* fkp, size_t fkpSize) {
+    std::vector<VerifiedFkpPapxEntry> entries;
+    if (fkpSize < 512) return entries;
+
+    uint8_t cpara = fkp[511];
+    if (cpara == 0 || cpara > 26) return entries;
+
+    size_t rgbxStart = (cpara + 1) * 4;
+
+    for (int k = 0; k < cpara; k++) {
+        VerifiedFkpPapxEntry entry;
+        entry.fcStart = SVBT32ToUInt32(fkp + k * 4);
+        entry.fcEnd = SVBT32ToUInt32(fkp + (k + 1) * 4);
+        entry.origFcEnd = entry.fcEnd;
+
+        uint8_t bOffset = fkp[rgbxStart + k * 13];
+        if (bOffset == 0) {
+            entries.push_back(entry);
+            continue;
+        }
+
+        size_t papxOffset = bOffset * 2;
+        if (papxOffset >= 512) {
+            entries.push_back(entry);
+            continue;
+        }
+
+        uint8_t cb = fkp[papxOffset];
+        if (cb == 0) {
+            // Extended PAPX
+            if (papxOffset + 4 < 512) {
+                uint8_t cbPAPX = fkp[papxOffset + 1];
+                // Prevent integer underflow: need cbPAPX >= 2 for valid grpprl
+                if (cbPAPX >= 2) {
+                    size_t grpprlSize = cbPAPX * 2 - 2;
+                    size_t grpprlStart = papxOffset + 4;
+                    if (grpprlStart + grpprlSize <= 512) {
+                        entry.grpprl.assign(fkp + grpprlStart, fkp + grpprlStart + grpprlSize);
+                    }
+                }
+            }
+        } else {
+            // Standard PAPX
+            // Prevent integer underflow: need cb >= 2 for valid grpprl
+            if (cb >= 2) {
+                size_t grpprlSize = cb * 2 - 3;
+                size_t grpprlStart = papxOffset + 3;
+                if (grpprlStart + grpprlSize <= 512) {
+                    entry.grpprl.assign(fkp + grpprlStart, fkp + grpprlStart + grpprlSize);
+                }
+            }
+        }
+        entries.push_back(entry);
+    }
+    return entries;
+}
+
+// Verified: UTF-16LE to UTF-8 conversion with garbled text filtering
+// Filters out:
+// 1. Hyperlink field data (byte-reversed ASCII that looks like CJK chars)
+// 2. Invalid Unicode ranges (Yi syllables, CJK Compatibility)
+static std::string verifiedUtf16ToUtf8(const std::vector<uint8_t>& wd, uint32_t start, uint32_t end) {
+    std::string result;
+    int garbledCount = 0;
+    int cjkExtACount = 0;
+
+    for (uint32_t i = start; i + 1 < end && i + 1 < wd.size(); i += 2) {
+        uint16_t ch = SVBT16ToUInt16(wd.data() + i);
+
+        // Preserve 0x0001 as image marker, skip other control chars
+        if (ch == 0x0001) {
+            result += '\x01';  // Preserve image placeholder marker
+            continue;
+        }
+        if (ch <= 0x001F) continue;  // Skip other control chars
+
+        // CJK Extension A (U+3400-U+4DBF) rarely used in normal text
+        // These often appear when ASCII bytes are reversed (e.g., 'p' 0x0070 → 0x7000 = U+7000)
+        if (ch >= 0x3400 && ch <= 0x4DBF) {
+            cjkExtACount++;
+            continue;  // Skip - likely garbled hyperlink data
+        }
+
+        // CJK Extension B and beyond (U+20000+) can't appear in single UTF-16
+        // But surrogate pairs might indicate these - skip for safety
+        if (ch >= 0xD800 && ch <= 0xDFFF) continue;
+
+        // Yi syllables (U+A000-U+AFFF) - rare, often garbled
+        if (ch >= 0xA000 && ch <= 0xAFFF) {
+            garbledCount++;
+            continue;
+        }
+
+        // CJK Compatibility Ideographs (U+F900-U+FAFF) - often garbled
+        if (ch >= 0xF900 && ch <= 0xFAFF) {
+            garbledCount++;
+            continue;
+        }
+
+        // Normal ASCII or valid CJK
+        if (ch < 0x80) {
+            result += static_cast<char>(ch);
+        } else if (ch < 0x800) {
+            result += static_cast<char>(0xC0 | (ch >> 6));
+            result += static_cast<char>(0x80 | (ch & 0x3F));
+        } else {
+            result += static_cast<char>(0xE0 | (ch >> 12));
+            result += static_cast<char>(0x80 | ((ch >> 6) & 0x3F));
+            result += static_cast<char>(0x80 | (ch & 0x3F));
+        }
+    }
+
+    // If we have many CJK Extension A characters, this is likely hyperlink data
+    // Return empty to avoid inserting garbage
+    if (cjkExtACount > 2) {
+        return "";  // Likely hyperlink field data with reversed bytes
+    }
+
+    // If more than 30% filtered as garbled, skip (unless just image marker)
+    if (garbledCount > 0 && result.size() > 0) {
+        int totalChars = (end - start) / 2;
+        if (garbledCount > totalChars / 3 && result.find('\x01') == std::string::npos) {
+            return "";
+        }
+    }
+
+    return result;
+}
+
+// Post-process table: calculate gridSpan based on colBoundaries vs colWidths
+// Reference: libreoffice_doc_test.cpp lines 755-798
+static void postProcessTable(WordTable& table) {
+    if (table.colWidths.empty()) return;
+
+    int gridCols = static_cast<int>(table.colWidths.size()) - 1;
+    if (gridCols <= 0) return;
+
+    // Step 1: Calculate gridSpan by comparing colBoundaries with colWidths
+    for (auto& row : table.rows) {
+        if (row.colBoundaries.empty()) continue;
+
+        int rowCols = static_cast<int>(row.cells.size());
+        // If row has same number of cells as grid columns, no merging needed
+        if (rowCols == gridCols) continue;
+
+        // Calculate gridSpan for each cell by comparing boundaries
+        for (int c = 0; c < rowCols && c + 1 < (int)row.colBoundaries.size(); c++) {
+            int16_t cellStart = row.colBoundaries[c];
+            int16_t cellEnd = row.colBoundaries[c + 1];
+
+            int span = 0;
+            for (int g = 0; g < gridCols; g++) {
+                // Check if cell overlaps with this grid column
+                if (cellStart < table.colWidths[g + 1] && cellEnd > table.colWidths[g]) {
+                    span++;
+                }
+            }
+            if (span > 1) {
+                row.cells[c].colSpan = span;
+            }
+        }
+    }
+
+    // Step 2: Assign texts from rawCellTexts, merging for colSpan > 1
+    for (auto& row : table.rows) {
+        int textCount = static_cast<int>(row.rawCellTexts.size());
+        int cellCount = static_cast<int>(row.cells.size());
+
+        if (textCount == cellCount) {
+            // Simple case: one text per cell
+            for (int c = 0; c < cellCount; c++) {
+                row.cells[c].text = row.rawCellTexts[c];
+            }
+        } else {
+            // Complex case: merge texts for cells with colSpan > 1
+            int textIdx = 0;
+            for (int c = 0; c < cellCount && textIdx < textCount; c++) {
+                row.cells[c].text = row.rawCellTexts[textIdx];
+                textIdx++;
+
+                // Append texts from merged columns
+                for (int s = 1; s < row.cells[c].colSpan && textIdx < textCount; s++) {
+                    if (!row.rawCellTexts[textIdx].empty()) {
+                        row.cells[c].text += "\n" + row.rawCellTexts[textIdx];
+                    }
+                    textIdx++;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Verified DocTableDetector - FKP Scanning with ProcessSpecial Algorithm
+// ============================================================================
+class VerifiedDocTableDetector {
+public:
+    bool loadFromWordDoc(const std::vector<uint8_t>& wordDoc);
+    bool loadFromWordDocWithPieceTable(const std::vector<uint8_t>& wordDoc,
+                                        const std::vector<uint8_t>& tableData,
+                                        uint32_t fcClx, uint32_t lcbClx);
+    std::vector<WordDocumentElement> detectAll();
+
+private:
+    std::vector<uint8_t> m_wordDoc;
+    uint32_t m_cbMac;
+    std::vector<VerifiedFkpPapxEntry> m_allPapx;
+    std::map<uint32_t, TtpRowInfo> m_ttpBands;
+
+    // Piece Table for encoding detection
+    struct PieceEntry {
+        uint32_t fcStart;     // Start FC (byte offset in WordDocument)
+        uint32_t fcEnd;       // End FC
+        bool isANSI;          // true = ANSI (1 byte/char), false = UTF-16LE (2 bytes/char)
+    };
+    std::vector<PieceEntry> m_pieceTable;
+
+    // Pre-scanned text segments from Piece Table traversal
+    struct PreScannedSegment {
+        std::string text;
+        char delimiter;       // '\r' (para), '\x07' (cell), '\0' (end)
+        uint32_t fcStart;     // Start FC of text
+        uint32_t fcEnd;       // FC position of delimiter
+    };
+    std::vector<PreScannedSegment> m_textSegments;
+
+    // Parse Piece Table from Clx
+    bool parsePieceTable(const std::vector<uint8_t>& tableData, uint32_t fcClx, uint32_t lcbClx);
+
+    // Pre-scan all text segments using Piece Table traversal (correct text extraction)
+    void preScanTextSegments();
+
+    // Find text segment that covers given FC range
+    std::string findTextForFcRange(uint32_t fcStart, uint32_t fcEnd);
+
+    // Check if text at given FC range should be decoded as ANSI
+    bool isANSIAt(uint32_t fcStart, uint32_t fcEnd);
+
+    // Extract ANSI text (1 byte per character)
+    std::string extractANSIText(uint32_t fcStart, uint32_t fcEnd);
+
+    // Extract text with encoding detection based on Piece Table
+    std::string extractCellText(uint32_t fcStart, uint32_t fcEnd, uint32_t origFcEnd);
+};
+
+bool VerifiedDocTableDetector::loadFromWordDoc(const std::vector<uint8_t>& wordDoc) {
+    m_wordDoc = wordDoc;
+    m_pieceTable.clear();  // No piece table info in this mode
+
+    if (m_wordDoc.size() < 512) {
+        OH_LOG_ERROR(LOG_APP, "VerifiedDocTableDetector: WordDocument too small");
+        return false;
+    }
+
+    m_cbMac = SVBT32ToUInt32(m_wordDoc.data() + 0x40);
+    OH_LOG_INFO(LOG_APP, "VerifiedDocTableDetector: cbMac=%{public}d (no Piece Table)", (int)m_cbMac);
+
+    // Scan WordDocument for PAPX FKP pages
+    for (size_t pageOffset = 0; pageOffset < m_wordDoc.size(); pageOffset += 512) {
+        if (pageOffset + 512 > m_wordDoc.size()) break;
+
+        uint8_t crun = m_wordDoc[pageOffset + 511];
+        if (crun == 0 || crun > 26) continue;
+
+        uint32_t fc0 = SVBT32ToUInt32(m_wordDoc.data() + pageOffset);
+        uint32_t fc1 = SVBT32ToUInt32(m_wordDoc.data() + pageOffset + 4);
+
+        if (fc0 > m_cbMac || fc1 <= fc0 || fc1 > m_cbMac) continue;
+
+        auto fkpEntries = verifiedParsePapxFkp(m_wordDoc.data() + pageOffset, 512);
+        for (const auto& e : fkpEntries) {
+            m_allPapx.push_back(e);
+        }
+    }
+
+    if (m_allPapx.empty()) {
+        OH_LOG_ERROR(LOG_APP, "VerifiedDocTableDetector: No valid PAPX FKP found");
+        return false;
+    }
+
+    std::sort(m_allPapx.begin(), m_allPapx.end(),
+              [](const VerifiedFkpPapxEntry& a, const VerifiedFkpPapxEntry& b) {
+                  return a.fcStart < b.fcStart;
+              });
+
+    for (size_t i = 0; i + 1 < m_allPapx.size(); i++) {
+        if (m_allPapx[i].fcEnd > m_allPapx[i + 1].fcStart) {
+            m_allPapx[i].fcEnd = m_allPapx[i + 1].fcStart;
+        }
+    }
+
+    OH_LOG_INFO(LOG_APP, "VerifiedDocTableDetector: Total PAPX entries: %{public}d", (int)m_allPapx.size());
+
+    // Pre-scan TTP marks
+    for (const auto& papx : m_allPapx) {
+        if (papx.grpprl.empty()) continue;
+        if (verifiedIsTtpMark(papx.grpprl.data(), papx.grpprl.size())) {
+            std::vector<uint8_t> operand;
+            if (verifiedFindSprmByGroup(papx.grpprl.data(), papx.grpprl.size(), 0x08, 5, operand)) {
+                TtpRowInfo info;
+                if (verifiedParseTDefTable(operand.data(), operand.size(), info)) {
+                    m_ttpBands[papx.fcEnd] = info;
+                }
+            }
+        }
+    }
+
+    OH_LOG_INFO(LOG_APP, "VerifiedDocTableDetector: TTP marks: %{public}d", (int)m_ttpBands.size());
+    return true;
+}
+
+bool VerifiedDocTableDetector::loadFromWordDocWithPieceTable(const std::vector<uint8_t>& wordDoc,
+                                                              const std::vector<uint8_t>& tableData,
+                                                              uint32_t fcClx, uint32_t lcbClx) {
+    m_wordDoc = wordDoc;
+
+    if (m_wordDoc.size() < 512) {
+        OH_LOG_ERROR(LOG_APP, "VerifiedDocTableDetector: WordDocument too small");
+        return false;
+    }
+
+    m_cbMac = SVBT32ToUInt32(m_wordDoc.data() + 0x40);
+    OH_LOG_INFO(LOG_APP, "VerifiedDocTableDetector: cbMac=%{public}d", (int)m_cbMac);
+
+    // Parse Piece Table first
+    if (parsePieceTable(tableData, fcClx, lcbClx)) {
+        OH_LOG_INFO(LOG_APP, "VerifiedDocTableDetector: Piece Table parsed, %{public}d pieces", (int)m_pieceTable.size());
+    }
+
+    // Scan WordDocument for PAPX FKP pages
+    for (size_t pageOffset = 0; pageOffset < m_wordDoc.size(); pageOffset += 512) {
+        if (pageOffset + 512 > m_wordDoc.size()) break;
+
+        uint8_t crun = m_wordDoc[pageOffset + 511];
+        if (crun == 0 || crun > 26) continue;
+
+        uint32_t fc0 = SVBT32ToUInt32(m_wordDoc.data() + pageOffset);
+        uint32_t fc1 = SVBT32ToUInt32(m_wordDoc.data() + pageOffset + 4);
+
+        if (fc0 > m_cbMac || fc1 <= fc0 || fc1 > m_cbMac) continue;
+
+        auto fkpEntries = verifiedParsePapxFkp(m_wordDoc.data() + pageOffset, 512);
+        for (const auto& e : fkpEntries) {
+            m_allPapx.push_back(e);
+        }
+    }
+
+    if (m_allPapx.empty()) {
+        OH_LOG_ERROR(LOG_APP, "VerifiedDocTableDetector: No valid PAPX FKP found");
+        return false;
+    }
+
+    std::sort(m_allPapx.begin(), m_allPapx.end(),
+              [](const VerifiedFkpPapxEntry& a, const VerifiedFkpPapxEntry& b) {
+                  return a.fcStart < b.fcStart;
+              });
+
+    for (size_t i = 0; i + 1 < m_allPapx.size(); i++) {
+        if (m_allPapx[i].fcEnd > m_allPapx[i + 1].fcStart) {
+            m_allPapx[i].fcEnd = m_allPapx[i + 1].fcStart;
+        }
+    }
+
+    OH_LOG_INFO(LOG_APP, "VerifiedDocTableDetector: Total PAPX entries: %{public}d", (int)m_allPapx.size());
+
+    // Pre-scan TTP marks
+    for (const auto& papx : m_allPapx) {
+        if (papx.grpprl.empty()) continue;
+        if (verifiedIsTtpMark(papx.grpprl.data(), papx.grpprl.size())) {
+            std::vector<uint8_t> operand;
+            if (verifiedFindSprmByGroup(papx.grpprl.data(), papx.grpprl.size(), 0x08, 5, operand)) {
+                TtpRowInfo info;
+                if (verifiedParseTDefTable(operand.data(), operand.size(), info)) {
+                    m_ttpBands[papx.fcEnd] = info;
+                }
+            }
+        }
+    }
+
+    OH_LOG_INFO(LOG_APP, "VerifiedDocTableDetector: TTP marks: %{public}d", (int)m_ttpBands.size());
+    return true;
+}
+
+bool VerifiedDocTableDetector::parsePieceTable(const std::vector<uint8_t>& tableData,
+                                                 uint32_t fcClx, uint32_t lcbClx) {
+    m_pieceTable.clear();
+
+    if (fcClx + lcbClx > tableData.size() || lcbClx == 0) {
+        OH_LOG_WARN(LOG_APP, "VerifiedDocTableDetector: Invalid Clx bounds");
+        return false;
+    }
+
+    size_t pos = fcClx;
+    size_t end = fcClx + lcbClx;
+
+    // Find Pcdt (type 0x02)
+    while (pos < end) {
+        uint8_t clxType = tableData[pos];
+        if (clxType == 0x01) {
+            pos++;
+            if (pos + 2 > end) break;
+            uint16_t cbGrpprl = tableData[pos] | (tableData[pos + 1] << 8);
+            pos += 2 + cbGrpprl;
+        } else if (clxType == 0x02) {
+            pos++;
+            break;
+        } else {
+            pos++;
+        }
+    }
+
+    if (pos + 4 > end) return false;
+
+    // Read lcbPlcPcd
+    uint32_t lcbPlcPcd = tableData[pos] | (tableData[pos + 1] << 8) |
+                         (tableData[pos + 2] << 16) | (tableData[pos + 3] << 24);
+    pos += 4;
+
+    size_t pcdStart = pos;
+    if (pcdStart + lcbPlcPcd > end) return false;
+
+    // PlcPcd: (n+1) CP values + n Pcd entries = (n+1)*4 + n*8 = 4 + n*12
+    size_t n = (lcbPlcPcd - 4) / 12;
+    if (n == 0 || n > 10000) return false;
+
+    // Read CP array
+    std::vector<uint32_t> cps(n + 1);
+    size_t cpPos = pcdStart;
+    for (size_t i = 0; i <= n; i++) {
+        cps[i] = tableData[cpPos] | (tableData[cpPos + 1] << 8) |
+                 (tableData[cpPos + 2] << 16) | (tableData[cpPos + 3] << 24);
+        cpPos += 4;
+    }
+
+    // Read Pcd entries
+    size_t pcdPos = pcdStart + (n + 1) * 4;
+    for (size_t i = 0; i < n; i++) {
+        // Pcd structure: 2 bytes unused + 4 bytes fc + 2 bytes prm
+        uint32_t fc = tableData[pcdPos + 2] | (tableData[pcdPos + 3] << 8) |
+                      (tableData[pcdPos + 4] << 16) | (tableData[pcdPos + 5] << 24);
+
+        PieceEntry piece;
+        // According to MS-DOC: bit 30 of fc is fCompressed
+        // fCompressed = 0 → ANSI (1 byte/char), fc/2 is actual offset
+        // fCompressed = 1 → Unicode (2 bytes/char), fc is actual offset
+        bool fCompressed = ((fc >> 30) & 1) == 0;
+        piece.isANSI = fCompressed;  // ANSI if compressed
+        piece.fcStart = (fCompressed ? (fc & 0x3FFFFFFF) / 2 : fc & 0x3FFFFFFF);
+
+        // Calculate fcEnd from CP range
+        uint32_t cpRange = cps[i + 1] - cps[i];
+        piece.fcEnd = piece.fcStart + (fCompressed ? cpRange : cpRange * 2);
+
+        m_pieceTable.push_back(piece);
+        pcdPos += 8;
+    }
+
+    return true;
+}
+
+// Pre-scan all text segments using Piece Table traversal (correct text extraction method)
+void VerifiedDocTableDetector::preScanTextSegments() {
+    m_textSegments.clear();
+
+    if (m_wordDoc.empty() || m_pieceTable.empty()) {
+        OH_LOG_WARN(LOG_APP, "DOC: preScanTextSegments - no data available");
+        return;
+    }
+
+    OH_LOG_INFO(LOG_APP, "DOC: preScanTextSegments - scanning %{public}d pieces", (int)m_pieceTable.size());
+
+    std::string currentText;
+    uint32_t currentFcStart = 0;
+
+    for (const auto& piece : m_pieceTable) {
+        uint32_t pieceFcStart = piece.fcStart;
+        uint32_t pieceFcEnd = piece.fcEnd;
+
+        if (pieceFcStart >= m_wordDoc.size() || pieceFcEnd > m_wordDoc.size()) {
+            continue;
+        }
+
+        // Calculate character count based on encoding
+        uint32_t charCount = piece.isANSI ? (pieceFcEnd - pieceFcStart) : (pieceFcEnd - pieceFcStart) / 2;
+
+        // Decode text from this piece
+        std::string pieceText;
+        if (piece.isANSI) {
+            // ANSI (1 byte per char) - inline CP1252 decoder
+            for (uint32_t i = pieceFcStart; i < pieceFcEnd && i < m_wordDoc.size(); i++) {
+                uint8_t ch = m_wordDoc[i];
+
+                // Skip null bytes and invalid XML control characters
+                if (ch == 0x00) continue;
+                if (ch < 0x20 && ch != 0x09 && ch != 0x0A && ch != 0x0D) continue;
+
+                if (ch < 0x80) {
+                    // ASCII
+                    pieceText += static_cast<char>(ch);
+                } else {
+                    // Extended ASCII (Windows-1252 / CP1252 encoding)
+                    static const uint16_t cp1252Map[128] = {
+                        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+                        0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+                        0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                        0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+                        0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,
+                        0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,
+                        0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+                        0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,
+                        0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7,
+                        0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,
+                        0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,
+                        0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF,
+                        0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7,
+                        0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+                        0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7,
+                        0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF
+                    };
+                    uint16_t uni = cp1252Map[ch - 0x80];
+                    if (uni < 0x80) {
+                        pieceText += static_cast<char>(uni);
+                    } else if (uni < 0x800) {
+                        pieceText += static_cast<char>(0xC0 | (uni >> 6));
+                        pieceText += static_cast<char>(0x80 | (uni & 0x3F));
+                    } else {
+                        pieceText += static_cast<char>(0xE0 | (uni >> 12));
+                        pieceText += static_cast<char>(0x80 | ((uni >> 6) & 0x3F));
+                        pieceText += static_cast<char>(0x80 | (uni & 0x3F));
+                    }
+                }
+            }
+        } else {
+            // UTF-16LE (2 bytes per char)
+            for (uint32_t i = pieceFcStart; i + 1 < pieceFcEnd && i + 1 < m_wordDoc.size(); i += 2) {
+                uint16_t ch = SVBT16ToUInt16(m_wordDoc.data() + i);
+
+                // Skip null bytes
+                if (ch == 0x0000) continue;
+
+                // Convert to UTF-8
+                if (ch < 0x80) {
+                    pieceText += static_cast<char>(ch);
+                } else if (ch < 0x800) {
+                    pieceText += static_cast<char>(0xC0 | (ch >> 6));
+                    pieceText += static_cast<char>(0x80 | (ch & 0x3F));
+                } else {
+                    pieceText += static_cast<char>(0xE0 | (ch >> 12));
+                    pieceText += static_cast<char>(0x80 | ((ch >> 6) & 0x3F));
+                    pieceText += static_cast<char>(0x80 | (ch & 0x3F));
+                }
+            }
+        }
+
+        // Scan through decoded text looking for delimiters
+        size_t charIdx = 0;
+        for (size_t byteIdx = 0; byteIdx < pieceText.size(); ) {
+            unsigned char firstByte = (unsigned char)pieceText[byteIdx];
+
+            // Determine UTF-8 character length
+            int charLen = 1;
+            if ((firstByte & 0x80) != 0) {
+                if ((firstByte & 0xE0) == 0xC0) charLen = 2;
+                else if ((firstByte & 0xF0) == 0xE0) charLen = 3;
+                else if ((firstByte & 0xF8) == 0xF0) charLen = 4;
+            }
+
+            if (byteIdx + charLen > pieceText.size()) break;
+
+            // Calculate FC position for this character
+            uint32_t charFc = piece.isANSI ? pieceFcStart + charIdx : pieceFcStart + charIdx * 2;
+
+            // Check for delimiters (ASCII characters)
+            if (firstByte == '\r' || firstByte == '\x07' || firstByte == '\x0B' || firstByte == '\x0C') {
+                // Trim trailing whitespace
+                std::string trimmed = currentText;
+                while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t')) {
+                    trimmed.pop_back();
+                }
+
+                // Create segment
+                PreScannedSegment seg;
+                seg.text = trimmed;
+                seg.delimiter = (char)firstByte;
+                seg.fcStart = currentFcStart;
+                seg.fcEnd = charFc;
+
+                m_textSegments.push_back(seg);
+                currentText.clear();
+                currentFcStart = charFc + (piece.isANSI ? 1 : 2);  // Next segment starts after delimiter
+            } else if (firstByte == '\n') {
+                // LF becomes space
+                currentText += ' ';
+            } else if (firstByte == '\x01' || firstByte == '\x02' || firstByte == '\x03' || firstByte == '\x04' || firstByte == '\x05') {
+                // Skip invalid XML control characters (embedded object markers, OLE, etc.)
+                // Images are extracted separately from Data stream
+            } else if (firstByte != '\0') {
+                // Regular character - append full UTF-8 sequence
+                currentText.append(pieceText, byteIdx, charLen);
+            }
+
+            byteIdx += charLen;
+            charIdx++;
+        }
+    }
+
+    // Handle last segment (no delimiter)
+    if (!currentText.empty()) {
+        std::string trimmed = currentText;
+        while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t')) {
+            trimmed.pop_back();
+        }
+
+        PreScannedSegment seg;
+        seg.text = trimmed;
+        seg.delimiter = '\0';
+        seg.fcStart = currentFcStart;
+        seg.fcEnd = m_wordDoc.size();
+
+        m_textSegments.push_back(seg);
+    }
+
+    // Log results
+    int cellMarkCount = 0, paraMarkCount = 0;
+    for (const auto& seg : m_textSegments) {
+        if (seg.delimiter == '\x07') cellMarkCount++;
+        else if (seg.delimiter == '\r') paraMarkCount++;
+    }
+    OH_LOG_INFO(LOG_APP, "DOC: preScanTextSegments - %{public}d segments (%{public}d cells, %{public}d paras)",
+                (int)m_textSegments.size(), cellMarkCount, paraMarkCount);
+}
+
+// Find text segment(s) that cover the given FC range
+std::string VerifiedDocTableDetector::findTextForFcRange(uint32_t fcStart, uint32_t fcEnd) {
+    std::string result;
+
+    for (const auto& seg : m_textSegments) {
+        // Check if segment overlaps with requested range
+        if (seg.fcStart < fcEnd && seg.fcEnd > fcStart) {
+            if (!result.empty()) {
+                result += "\n";  // Join multiple segments with newline
+            }
+            result += seg.text;
+        }
+    }
+
+    return result;
+}
+
+bool VerifiedDocTableDetector::isANSIAt(uint32_t fcStart, uint32_t fcEnd) {
+    for (const auto& piece : m_pieceTable) {
+        if (fcStart >= piece.fcStart && fcStart < piece.fcEnd) {
+            return piece.isANSI;
+        }
+    }
+    return false;  // Default to Unicode if not found
+}
+
+// Helper: Check if text appears to be garbled (byte-reversed ASCII) vs valid CJK
+static bool isGarbledUTF16(const std::string& text) {
+    if (text.empty()) return false;
+
+    int garbledCount = 0;
+    int validCJKCount = 0;
+    int normalCount = 0;
+
+    for (size_t i = 0; i < text.size(); ) {
+        unsigned char c = (unsigned char)text[i];
+        if (c < 0x80) {
+            // ASCII character
+            if (c >= ' ' && c <= '~') normalCount++;
+            i++;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            // 3-byte UTF-8
+            if (i + 2 < text.size()) {
+                uint32_t cp = ((c & 0x0F) << 12) |
+                              (((unsigned char)text[i+1] & 0x3F) << 6) |
+                              ((unsigned char)text[i+2] & 0x3F);
+
+                // Valid CJK Unified Ideographs (common Chinese characters)
+                if (cp >= 0x4E00 && cp <= 0x9FFF) {
+                    validCJKCount++;
+                }
+                // CJK Extension A - suspicious (from reversed bytes)
+                else if (cp >= 0x3400 && cp <= 0x4DBF) {
+                    garbledCount++;
+                }
+                // U+3A00-U+4DFF - very suspicious (reversed ASCII pattern)
+                else if (cp >= 0x3A00 && cp <= 0x4DFF) {
+                    garbledCount++;
+                }
+                // General punctuation, symbols - might be valid
+                else {
+                    normalCount++;
+                }
+            }
+            i += 3;
+        } else if (c >= 0xC0 && c <= 0xDF) {
+            // 2-byte UTF-8
+            i += 2;
+            normalCount += 2;
+        } else {
+            i++;
+        }
+    }
+
+    // If we have valid CJK characters, this is likely correct UTF-16LE decoding
+    // Don't treat as garbled even if some suspicious chars exist
+    if (validCJKCount > 2) return false;
+
+    // If garbled characters dominate and no valid CJK, treat as garbled
+    return (garbledCount > normalCount / 2 && garbledCount > 1 && validCJKCount == 0);
+}
+
+// Helper: Decode ANSI text (single byte per character) to UTF-8
+static std::string decodeANSIToUTF8(const std::vector<uint8_t>& wd, uint32_t start, uint32_t end) {
+    std::string result;
+    for (uint32_t i = start; i < end && i < wd.size(); i++) {
+        uint8_t ch = wd[i];
+
+        // Skip null bytes and invalid XML control characters
+        // XML 1.0 allows only: 0x09 (tab), 0x0A (LF), 0x0D (CR)
+        if (ch == 0x00) continue;
+        if (ch < 0x20 && ch != 0x09 && ch != 0x0A && ch != 0x0D) continue;
+
+        if (ch < 0x80) {
+            // ASCII
+            result += static_cast<char>(ch);
+        } else if (ch >= 0x80 && ch <= 0xFF) {
+            // Extended ASCII (Windows-1252 / CP1252 encoding)
+            // Map common extended chars to Unicode
+            static const uint16_t cp1252Map[128] = {
+                0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,  // 80-87
+                0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,  // 88-8F
+                0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,  // 90-97
+                0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,  // 98-9F
+                // A0-BF: Latin-1 Supplement (direct mapping)
+                0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,
+                0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,
+                0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+                0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,
+                // C0-FF: Latin Extended-A/B (direct mapping as Latin-1)
+                0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7,
+                0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,
+                0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,
+                0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF,
+                0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7,
+                0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+                0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7,
+                0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF
+            };
+            uint16_t uni = cp1252Map[ch - 0x80];
+            if (uni < 0x80) {
+                result += static_cast<char>(uni);
+            } else if (uni < 0x800) {
+                result += static_cast<char>(0xC0 | (uni >> 6));
+                result += static_cast<char>(0x80 | (uni & 0x3F));
+            } else {
+                result += static_cast<char>(0xE0 | (uni >> 12));
+                result += static_cast<char>(0x80 | ((uni >> 6) & 0x3F));
+                result += static_cast<char>(0x80 | (uni & 0x3F));
+            }
+        }
+    }
+    return result;
+}
+
+std::string VerifiedDocTableDetector::extractCellText(uint32_t fcStart, uint32_t fcEnd, uint32_t origFcEnd) {
+    // Early bounds check
+    if (fcStart >= m_wordDoc.size()) {
+        return "";
+    }
+
+    // Determine encoding from Piece Table
+    bool useANSI = isANSIAt(fcStart, fcEnd);
+
+    uint32_t actualEnd = fcEnd;
+    if (actualEnd <= fcStart || actualEnd > m_wordDoc.size()) {
+        actualEnd = origFcEnd;
+        if (actualEnd > m_wordDoc.size()) actualEnd = m_wordDoc.size();
+    }
+
+    // Search for cell/paragraph mark based on encoding
+    if (useANSI) {
+        // ANSI: 1 byte per character, search for 0x07 or 0x0D
+        for (uint32_t i = fcStart; i < actualEnd; i++) {
+            uint8_t ch = m_wordDoc[i];
+            if (ch == 0x07 || ch == 0x0D) {
+                actualEnd = i;
+                break;
+            }
+        }
+        return decodeANSIToUTF8(m_wordDoc, fcStart, actualEnd);
+    } else {
+        // Unicode (UTF-16LE): 2 bytes per character
+        for (uint32_t i = fcStart; i + 1 < actualEnd; i += 2) {
+            uint16_t ch = SVBT16ToUInt16(m_wordDoc.data() + i);
+            if (ch == 0x0007 || ch == 0x000D) {
+                actualEnd = i;
+                break;
+            }
+        }
+        return verifiedUtf16ToUtf8(m_wordDoc, fcStart, actualEnd);
+    }
+}
+
+std::vector<WordDocumentElement> VerifiedDocTableDetector::detectAll() {
+    std::vector<WordDocumentElement> elements;
+
+    OH_LOG_INFO(LOG_APP, "DOC: detectAll - PAPX entries: %{public}d, TTP bands: %{public}d", (int)m_allPapx.size(), (int)m_ttpBands.size());
+
+    // Step 1: Pre-scan all text segments using Piece Table (correct text extraction)
+    preScanTextSegments();
+    if (m_textSegments.empty()) {
+        OH_LOG_WARN(LOG_APP, "DOC: No text segments found, returning empty elements");
+        return elements;
+    }
+
+    // Safety limit: too many PAPX entries could cause memory issues
+    const size_t MAX_PAPX_ENTRIES = 50000;
+    if (m_allPapx.size() > MAX_PAPX_ENTRIES) {
+        OH_LOG_WARN(LOG_APP, "DOC: Too many PAPX entries (%{public}d), limiting to %{public}d",
+                    (int)m_allPapx.size(), (int)MAX_PAPX_ENTRIES);
+        m_allPapx.resize(MAX_PAPX_ENTRIES);
+    }
+
+    // Step 2: Table detection using PAPX traversal (keep existing logic)
+    // Track FC ranges that belong to tables
+    std::vector<std::pair<uint32_t, uint32_t>> tableFcRanges;  // (start, end)
+
+    int m_nInTable = 0;
+    bool m_bWasTabRowEnd = false;
+    WordTable currentTable;
+    bool inTable = false;
+    uint32_t currentTableStartFc = 0;
+    std::vector<std::string> currentRowTexts;
+
+    // Track which segments are already used (for non-table paragraphs)
+    std::set<size_t> usedSegmentIndices;
+
+    // Safety limit for row texts
+    const size_t MAX_ROW_TEXTS = 1000;
+
+    for (size_t papxIdx = 0; papxIdx < m_allPapx.size(); papxIdx++) {
+        const auto& papx = m_allPapx[papxIdx];
+
+        int nCellLevel = 0;
+        if (!papx.grpprl.empty()) {
+            nCellLevel = verifiedHasTabCellSprm(papx.grpprl.data(), papx.grpprl.size());
+        }
+
+        bool bStartTab = (m_nInTable < nCellLevel);
+        bool bStopTab = m_bWasTabRowEnd && (m_nInTable > nCellLevel);
+
+        m_bWasTabRowEnd = false;
+
+        if (bStopTab) {
+            m_nInTable--;
+            if (m_nInTable < 0) m_nInTable = 0;
+        }
+
+        if (bStartTab) {
+            m_nInTable++;
+            if (!inTable) {
+                currentTable = WordTable();
+                currentTable.startFc = papx.fcStart;
+                currentTableStartFc = papx.fcStart;
+                inTable = true;
+                currentRowTexts.clear();
+            }
+        }
+
+        if (inTable && nCellLevel > 0) {
+            bool isTtp = !papx.grpprl.empty() && verifiedIsTtpMark(papx.grpprl.data(), papx.grpprl.size());
+
+            if (isTtp) {
+                // TTP mark - end of row
+                WordTableRow row;
+
+                auto bandIt = m_ttpBands.find(papx.fcEnd);
+                if (bandIt != m_ttpBands.end()) {
+                    auto& band = bandIt->second;
+                    int nCols = band.nCols;
+
+                    // Store colBoundaries for gridSpan calculation later
+                    row.colBoundaries.clear();
+                    for (auto w : band.rgdxaCenter) {
+                        row.colBoundaries.push_back((int16_t)w);
+                    }
+
+                    // Create cells (colSpan will be calculated in post-processing)
+                    for (int c = 0; c < nCols; c++) {
+                        WordTableCell cell;
+                        cell.colSpan = 1;  // Will be updated in post-processing
+
+                        if (c < (int)band.cells.size()) {
+                            cell.vertMerge = band.cells[c].bVertMerge;
+                        }
+                        row.cells.push_back(cell);
+                    }
+
+                    // Store colWidths from first row's boundaries
+                    if (currentTable.colWidths.empty() && !band.rgdxaCenter.empty()) {
+                        for (auto w : band.rgdxaCenter) {
+                            currentTable.colWidths.push_back((int16_t)w);
+                        }
+                    }
+                }
+
+                currentTable.rows.push_back(row);
+                m_bWasTabRowEnd = true;
+
+                // Store texts for later assignment (after gridSpan calculation)
+                auto& pushedRow = currentTable.rows.back();
+                pushedRow.rawCellTexts = currentRowTexts;  // Store raw texts for post-processing
+                currentRowTexts.clear();
+            } else {
+                // Cell content paragraph - track FC range for later text collection
+                // We don't extract text here; instead we collect from pre-scanned cell segments at TTP mark
+                // Just update row start FC for tracking
+            }
+        }
+
+        if (inTable && nCellLevel == 0 && m_nInTable == 0) {
+            if (!currentTable.rows.empty()) {
+                // Record table FC range
+                tableFcRanges.push_back({currentTableStartFc, papx.fcEnd});
+
+                // Post-process: calculate gridSpan and assign texts
+                postProcessTable(currentTable);
+                elements.push_back(WordDocumentElement::makeTable(currentTable));
+            }
+            currentTable = WordTable();
+            inTable = false;
+            currentRowTexts.clear();
+        }
+    }
+
+    if (inTable && !currentTable.rows.empty()) {
+        // Record last table FC range
+        tableFcRanges.push_back({currentTableStartFc, m_cbMac});
+
+        postProcessTable(currentTable);
+        elements.push_back(WordDocumentElement::makeTable(currentTable));
+    }
+
+    // Step 3: Assign cell texts from pre-scanned cell segments (0x07 delimiter)
+    // For each table row, find cell segments within its FC range
+    for (auto& elem : elements) {
+        if (!elem.isTable) continue;
+
+        WordTable& table = elem.table;
+        uint32_t prevRowEndFc = table.startFc;
+
+        for (auto& row : table.rows) {
+            // Find row FC range: from previous row end to this row's last cell boundary
+            uint32_t rowEndFc = prevRowEndFc;
+            if (!row.colBoundaries.empty()) {
+                rowEndFc = row.colBoundaries.back() > prevRowEndFc ? row.colBoundaries.back() : prevRowEndFc + 100;
+            }
+
+            // Collect cell segments in this row's FC range
+            row.rawCellTexts.clear();
+            for (const auto& seg : m_textSegments) {
+                if (seg.delimiter == '\x07') {
+                    // Check if this cell segment is within the row's FC range
+                    if (seg.fcStart >= prevRowEndFc && seg.fcEnd <= rowEndFc + 50) {
+                        row.rawCellTexts.push_back(seg.text);
+                    }
+                }
+            }
+
+            // If no cell segments found, try fallback using extractCellText
+            if (row.rawCellTexts.empty() && !row.cells.empty()) {
+                for (size_t i = 0; i < row.cells.size(); i++) {
+                    // Use approximate FC range for each cell
+                    uint32_t cellStartFc = prevRowEndFc + i * 100;
+                    uint32_t cellEndFc = prevRowEndFc + (i + 1) * 100;
+                    std::string text = extractCellText(cellStartFc, cellEndFc, cellEndFc);
+                    row.rawCellTexts.push_back(text);
+                }
+            }
+
+            prevRowEndFc = rowEndFc;
+        }
+
+        // Post-process again to assign texts correctly
+        postProcessTable(table);
+    }
+
+    // Step 3: Add non-table paragraphs from pre-scanned segments
+    // Only include segments with '\r' delimiter (paragraph marks) that are not in table ranges
+    for (size_t segIdx = 0; segIdx < m_textSegments.size(); segIdx++) {
+        const auto& seg = m_textSegments[segIdx];
+
+        // Skip if already used for table cell
+        if (usedSegmentIndices.count(segIdx) > 0) {
+            continue;
+        }
+
+        // Skip cell mark segments (0x07) - they belong to tables
+        if (seg.delimiter == '\x07') {
+            continue;
+        }
+
+        // Check if segment FC range is within any table range
+        bool inTableRange = false;
+        for (const auto& range : tableFcRanges) {
+            if (seg.fcStart >= range.first && seg.fcEnd <= range.second) {
+                inTableRange = true;
+                break;
+            }
+        }
+
+        if (inTableRange) {
+            continue;
+        }
+
+        // Add as paragraph if text is not empty
+        if (!seg.text.empty()) {
+            // Skip hyperlink field data with garbled characters
+            bool shouldSkip = false;
+
+            // Check 1: Starts with "HYPERL" followed by non-ASCII
+            if (seg.text.find("HYPERL") == 0 && seg.text.size() > 6) {
+                char next = seg.text[6];
+                if ((unsigned char)next >= 0x80) {
+                    shouldSkip = true;
+                }
+            }
+
+            // Check 2: High ratio of multi-byte chars in short text
+            if (!shouldSkip && seg.text.size() > 5 && seg.text.size() < 200) {
+                int mbCount = 0;
+                int asciiCount = 0;
+                for (size_t i = 0; i < seg.text.size(); ) {
+                    unsigned char c = (unsigned char)seg.text[i];
+                    if (c < 0x80) {
+                        asciiCount++;
+                        i++;
+                    } else if (c >= 0xE0 && c <= 0xEF) {
+                        mbCount++;
+                        i += 3;
+                    } else if (c >= 0xC0 && c <= 0xDF) {
+                        mbCount++;
+                        i += 2;
+                    } else {
+                        i++;
+                    }
+                    if (mbCount > asciiCount * 2 && mbCount > 3) {
+                        shouldSkip = true;
+                    }
+                }
+            }
+
+            if (!shouldSkip) {
+                // Create paragraph with proper FC ordering
+                WordDocumentElement para = WordDocumentElement::makeParagraph(seg.text);
+
+                // Insert at correct position based on FC
+                size_t insertPos = elements.size();
+                for (size_t i = 0; i < elements.size(); i++) {
+                    if (!elements[i].isTable && elements[i].text.empty()) {
+                        continue;
+                    }
+                    // Find first element with FC > this segment's FC
+                    // For now, just append - ordering will be handled by sorting later
+                }
+                elements.push_back(para);
+            }
+        }
+    }
+
+    // Step 4: Sort elements by FC position to maintain document order
+    // Create a helper structure for sorting
+    struct ElementWithFc {
+        uint32_t fcStart;
+        WordDocumentElement element;
+    };
+    std::vector<ElementWithFc> sortableElements;
+
+    for (const auto& elem : elements) {
+        ElementWithFc swf;
+        if (elem.isTable) {
+            swf.fcStart = elem.table.startFc;
+        } else {
+            // For paragraphs, find the segment FC
+            for (const auto& seg : m_textSegments) {
+                if (seg.text == elem.text) {
+                    swf.fcStart = seg.fcStart;
+                    break;
+                }
+            }
+            if (swf.fcStart == 0 && !elem.text.empty()) {
+                swf.fcStart = UINT32_MAX;  // Put unknown paragraphs at end
+            }
+        }
+        swf.element = elem;
+        sortableElements.push_back(swf);
+    }
+
+    // Sort by FC
+    std::sort(sortableElements.begin(), sortableElements.end(),
+              [](const ElementWithFc& a, const ElementWithFc& b) {
+                  return a.fcStart < b.fcStart;
+              });
+
+    // Rebuild elements in sorted order
+    elements.clear();
+    for (const auto& swf : sortableElements) {
+        elements.push_back(swf.element);
+    }
+
+    OH_LOG_INFO(LOG_APP, "DOC: detectAll complete - %{public}d elements (%{public}d tables, %{public}d paragraphs)",
+                (int)elements.size(),
+                (int)std::count_if(elements.begin(), elements.end(), [](const WordDocumentElement& e) { return e.isTable; }),
+                (int)std::count_if(elements.begin(), elements.end(), [](const WordDocumentElement& e) { return !e.isTable && !e.text.empty(); }));
+
+    return elements;
+}
+
+// Helper: Check if text is likely hyperlink field data that should be skipped
+static bool isHyperlinkFieldData(const std::string& text) {
+    // Hyperlink fields often start with "HYPERLINK" or contain garbled URL data
+    if (text.find("HYPERLINK") != std::string::npos && text.size() > 20) {
+        // Check for garbled URL patterns
+        int garbledCount = 0;
+        for (char c : text) {
+            // Count unusual characters that shouldn't appear in normal URLs
+            if ((unsigned char)c >= 0x80) {
+                unsigned char firstByte = (unsigned char)c;
+                // UTF-8 continuation bytes or unusual multi-byte patterns
+                if (firstByte >= 0xE0 && firstByte <= 0xEF) {
+                    // 3-byte UTF-8 encoding - check if it's garbled
+                    garbledCount++;
+                }
+            }
+        }
+        // If more than 50% of characters after "HYPERLINK" are garbled, skip
+        if (garbledCount > (int)(text.size() - 10) / 2) {
+            return true;
+        }
+    }
+
+    // Check for patterns like "HYPERL义⁋栢" (HYPERLINK + garbled)
+    if (text.find("HYPERL") != std::string::npos) {
+        // Look for CJK characters immediately after HYPERL
+        size_t pos = text.find("HYPERL");
+        if (pos + 6 < text.size()) {
+            char next = text[pos + 6];
+            // If next char after HYPERL is CJK, it's likely garbled field data
+            if ((unsigned char)next >= 0x80) {
+                return true;
+            }
+        }
+    }
+
+    // Check for high ratio of reversed-byte patterns
+    // These often appear as characters like "瑴" (U+7474) from "tt" reversed
+    int unusualCount = 0;
+    int normalCount = 0;
+    for (size_t i = 0; i < text.size(); ) {
+        unsigned char c = (unsigned char)text[i];
+        if (c < 0x80) {
+            normalCount++;
+            i++;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            // 3-byte UTF-8 - check the code point
+            if (i + 2 < text.size()) {
+                uint32_t cp = ((c & 0x0F) << 12) |
+                              (((unsigned char)text[i+1] & 0x3F) << 6) |
+                              ((unsigned char)text[i+2] & 0x3F);
+                // CJK Extension A (U+3400-U+4DBF) indicates reversed bytes
+                if (cp >= 0x3400 && cp <= 0x4DBF) {
+                    unusualCount += 3;
+                } else if (cp >= 0x3A00 && cp <= 0x3FFF) {
+                    // U+3A00-U+3FFF also often appears from reversed bytes
+                    unusualCount += 3;
+                } else {
+                    normalCount += 3;
+                }
+                i += 3;
+            } else {
+                i++;
+            }
+        } else if (c >= 0xC0 && c <= 0xDF) {
+            i += 2;  // 2-byte UTF-8
+            normalCount += 2;
+        } else {
+            i++;
+        }
+    }
+
+    // If unusual characters dominate, it's likely field data
+    if (unusualCount > normalCount && unusualCount > 5) {
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Verified DOCX Writer Helper
+// ============================================================================
+static std::string verifiedBuildDocxContent(const std::vector<WordDocumentElement>& elements) {
+    std::string documentXml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\n"
+        "<w:body>\n";
+
+    for (const auto& elem : elements) {
+        if (!elem.isTable) {
+            // Paragraph
+            std::string escaped = xmlEscape(elem.text);
+            documentXml += "<w:p><w:r><w:t>" + escaped + "</w:t></w:r></w:p>\n";
+        } else {
+            // Table
+            const auto& table = elem.table;
+            documentXml += "<w:tbl>\n";
+
+            // tblPr with borders
+            documentXml += "<w:tblPr>\n"
+                "<w:tblStyle w:val=\"TableNormal\"/>\n"
+                "<w:tblW w:w=\"0\" w:type=\"auto\"/>\n"
+                "<w:tblBorders>\n"
+                "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\n"
+                "<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\n"
+                "<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\n"
+                "<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\n"
+                "<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\n"
+                "<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\n"
+                "</w:tblBorders>\n"
+                "</w:tblPr>\n";
+
+            // tblGrid
+            if (!table.colWidths.empty()) {
+                documentXml += "<w:tblGrid>\n";
+                for (size_t i = 0; i + 1 < table.colWidths.size(); i++) {
+                    int width = abs(table.colWidths[i + 1] - table.colWidths[i]);
+                    documentXml += "<w:gridCol w:w=\"" + std::to_string(width) + "\"/>\n";
+                }
+                documentXml += "</w:tblGrid>\n";
+            }
+
+            // Rows
+            for (const auto& row : table.rows) {
+                documentXml += "<w:tr>\n";
+                for (const auto& cell : row.cells) {
+                    documentXml += "<w:tc>\n";
+                    if (cell.colSpan > 1 || cell.vertMerge) {
+                        documentXml += "<w:tcPr>\n";
+                        if (cell.colSpan > 1) {
+                            documentXml += "<w:gridSpan w:val=\"" + std::to_string(cell.colSpan) + "\"/>\n";
+                        }
+                        if (cell.vertMerge) {
+                            documentXml += "<w:vMerge w:val=\"continue\"/>\n";
+                        }
+                        documentXml += "</w:tcPr>\n";
+                    }
+                    if (cell.text.empty()) {
+                        documentXml += "<w:p/>\n";
+                    } else {
+                        documentXml += "<w:p><w:r><w:t>" + xmlEscape(cell.text) + "</w:t></w:r></w:p>\n";
+                    }
+                    documentXml += "</w:tc>\n";
+                }
+                documentXml += "</w:tr>\n";
+            }
+            documentXml += "</w:tbl>\n";
+            documentXml += "<w:p/>\n";  // Paragraph after table
+        }
+    }
+
+    documentXml += "</w:body>\n</w:document>\n";
+    return documentXml;
 }
 
 /**
@@ -3110,7 +4572,18 @@ static std::vector<TableRegion> scanTablesSequential(
             }
 
             // ww8par.cxx:2757-2763: compute nCellLevel from HasParaSprm(0x2416)
-            int nextCellLevel = hasTabCellSprm(papxList[nextPi].fcStart);
+            // LibreOffice's HasParaSprm checks the CURRENT paragraph's PAPX.
+            // ww8par2.cxx:2019-2028: if HasTabCellSprm returns nullptr (!pParams), break.
+            //
+            // KEY: When bOffset=0, there is NO PAPX for that paragraph.
+            // LibreOffice's HasSprm returns nullptr → nCellLevel=0 → table ends.
+            // There is NO backward inheritance in LibreOffice's PLCF iterator.
+            // Each paragraph's table status is determined by its own PAPX only.
+            const PapxEntry* nextPe = findPapxByFc(papxList[nextPi].fcStart);
+            int nextCellLevel = computeCellLevel(nextPe);
+
+            // If bOffset=0 or no sprmPFInTable found, nextCellLevel=0
+            // LibreOffice behavior: table ends when nCellLevel drops to 0 after TTP
 
             OH_LOG_INFO(LOG_APP, "DOC: After TTP, PAPX[%{public}d] FC=%{public}d m_nInTable=%{public}d nextCellLevel=%{public}d",
                         (int)nextPi, (int)papxList[nextPi].fcStart, m_nInTable, nextCellLevel);
@@ -4075,11 +5548,11 @@ static std::vector<DocContentElement> extractDocContent(
                     int cellIdx = 0;
                     for (int k = prevTtp + 1; k < ttpIdx; k++, cellIdx++) {
                         // Use LibreOffice flags directly
-                        const WW8_TCell* pTc = (rowInfo && cellIdx < (int)rowInfo->cells.size())
+                        const OldWW8_TCell* pTc = (rowInfo && cellIdx < (int)rowInfo->cells.size())
                                         ? &rowInfo->cells[cellIdx] : nullptr;
 
                         // bMerged=1 means this cell is continuation of preceding cell
-                        // (LibreOffice WW8_TCell.bMerged, ww8struc.hxx:532)
+                        // (LibreOffice OldWW8_TCell.bMerged, ww8struc.hxx:532)
                         bool isContinuation = false;
                         if (pTc && pTc->bMerged == 1) {
                             isContinuation = true;
@@ -4109,7 +5582,7 @@ static std::vector<DocContentElement> extractDocContent(
                             // Calculate gridSpan from rgdxaCenter
                             tc.colSpan = (cellIdx < (int)cellSpan.size()) ? cellSpan[cellIdx] : 1;
 
-                            // Copy borders and properties from WW8_TCell
+                            // Copy borders and properties from OldWW8_TCell
                             if (pTc) {
                                 memcpy(tc.brcTop, pTc->brcTop, 4);
                                 memcpy(tc.brcLeft, pTc->brcLeft, 4);
@@ -4319,429 +5792,60 @@ bool OfficeConverter::convertDOC(const std::string& inputPath, const std::string
         filePath = "/" + filePath;
     }
 
-    // Read file
-    FILE* file = fopen(filePath.c_str(), "rb");
-    if (!file) {
-        result.errorMsg = "Cannot open file: " + filePath;
+    // Use DocTableDetector from ww8_table_parser.hpp
+    DocTableDetector detector;
+    if (!detector.load(filePath)) {
+        result.errorMsg = "Failed to parse DOC file: " + filePath;
+        OH_LOG_ERROR(LOG_APP, "DOC: Failed to load file: %{public}s", filePath.c_str());
         return false;
     }
 
-    fseek(file, 0, SEEK_END);
-    size_t fileSize = ftell(file);
-    fseek(file, 0, SEEK_SET);
+    OH_LOG_INFO(LOG_APP, "DOC: File loaded successfully, detecting content");
 
-    std::vector<uint8_t> fileData(fileSize);
-    fread(fileData.data(), 1, fileSize, file);
-    fclose(file);
+    // Detect all document elements (paragraphs, tables, images)
+    std::vector<DocumentElement> elements = detector.detectAll();
 
-    OH_LOG_INFO(LOG_APP, "DOC: File size: %{public}d bytes", (int)fileSize);
-
-    // Step 1: Parse OLE2 structure to find streams
-    std::vector<OLE2Entry> entries;
-    if (!parseOLE2Header(fileData.data(), fileSize, entries)) {
-        result.errorMsg = "Failed to parse OLE2 header";
-        return false;
+    // Count elements for result
+    int paraCount = 0;
+    int tableCount = 0;
+    int imageCount = 0;
+    for (const auto& elem : elements) {
+        if (elem.isTable) tableCount++;
+        else if (elem.isImage) imageCount++;
+        else if (!elem.text.empty()) paraCount++;
     }
 
-    // Find required streams
-    const OLE2Entry* wordDocEntry = nullptr;
-    const OLE2Entry* table0Entry = nullptr;
-    const OLE2Entry* table1Entry = nullptr;
-
-    for (const auto& entry : entries) {
-        if (entry.name == "WordDocument") wordDocEntry = &entry;
-        else if (entry.name == "0Table") table0Entry = &entry;
-        else if (entry.name == "1Table") table1Entry = &entry;
-    }
-
-    if (!wordDocEntry) {
-        result.errorMsg = "WordDocument stream not found";
-        return false;
-    }
-
-    OH_LOG_INFO(LOG_APP, "DOC: Found WordDocument (size=%{public}d), 0Table=%{public}d, 1Table=%{public}d",
-                (int)wordDocEntry->size,
-                table0Entry ? (int)table0Entry->size : -1,
-                table1Entry ? (int)table1Entry->size : -1);
-
-    // Step 2: Read WordDocument stream
-    std::vector<uint8_t> wordDocData;
-    if (!readOLE2Stream(fileData.data(), fileSize, *wordDocEntry, wordDocData)) {
-        result.errorMsg = "Failed to read WordDocument stream";
-        return false;
-    }
-
-    OH_LOG_INFO(LOG_APP, "DOC: WordDocument stream read: %{public}d bytes", (int)wordDocData.size());
-
-    // Step 3: Parse FIB to find piece table location
-    FibParseResult fib = parseFIB(wordDocData);
-
-    // Step 4: Read the appropriate table stream (0Table or 1Table)
-    std::vector<uint8_t> tableData;
-    const OLE2Entry* tableEntry = fib.useTable1 ? table1Entry : table0Entry;
-
-    if (tableEntry) {
-        if (!readOLE2Stream(fileData.data(), fileSize, *tableEntry, tableData)) {
-            OH_LOG_WARN(LOG_APP, "DOC: Failed to read %{public}s stream",
-                        fib.useTable1 ? "1Table" : "0Table");
-        }
-    }
-
-    OH_LOG_INFO(LOG_APP, "DOC: Table stream (%{public}s) read: %{public}d bytes",
-                fib.useTable1 ? "1Table" : "0Table", (int)tableData.size());
-
-    // Read Data stream early for PAP parsing (PrcData contains table row properties)
-    std::vector<uint8_t> dataStream;
-    for (const auto& entry : entries) {
-        if (entry.name == "Data") {
-            readOLE2Stream(fileData.data(), fileSize, entry, dataStream);
-            OH_LOG_INFO(LOG_APP, "DOC: Data stream read: %{public}d bytes (for PrcData)", (int)dataStream.size());
-            break;
-        }
-    }
-
-    // Step 5: Parse piece table and extract structured content
-    std::vector<DocContentElement> contentElements;
-    std::vector<TextPiece> pieces;
-
-    if (fib.valid && fib.lcbClx > 0 && tableData.size() > 0) {
-        OH_LOG_INFO(LOG_APP, "DOC: Parsing piece table (fcClx=%{public}d, lcbClx=%{public}d)",
-                    (int)fib.fcClx, (int)fib.lcbClx);
-
-        pieces = parsePieceTable(tableData.data(), tableData.size(),
-                                 fib.fcClx, fib.lcbClx);
-
-        OH_LOG_INFO(LOG_APP, "DOC: Parsed %{public}d text pieces", (int)pieces.size());
-
-        if (!pieces.empty()) {
-            contentElements = extractDocContent(wordDocData, tableData, dataStream, fib, pieces);
-        }
-    }
-
-    // Fallback if piece table parsing failed
-    if (contentElements.empty()) {
-        OH_LOG_WARN(LOG_APP, "DOC: Piece table parsing failed, trying fallback");
-
-        std::vector<uint8_t> altTableData;
-        const OLE2Entry* altTableEntry = fib.useTable1 ? table0Entry : table1Entry;
-        if (altTableEntry) {
-            readOLE2Stream(fileData.data(), fileSize, *altTableEntry, altTableData);
-        }
-
-        if (!altTableData.empty() && fib.valid && fib.lcbClx > 0) {
-            auto altPieces = parsePieceTable(altTableData.data(), altTableData.size(),
-                                              fib.fcClx, fib.lcbClx);
-            if (!altPieces.empty()) {
-                contentElements = extractDocContent(wordDocData, altTableData, dataStream, fib, altPieces);
-            }
-        }
-
-        // Last resort: scan for text
-        if (contentElements.empty()) {
-            OH_LOG_WARN(LOG_APP, "DOC: All parsing failed, scanning for text patterns");
-            std::string allText;
-            for (size_t offset = 0; offset + 1 < wordDocData.size(); offset += 2) {
-                uint16_t ch = wordDocData[offset] | (wordDocData[offset + 1] << 8);
-                if (ch >= 0x4E00 && ch <= 0x9FFF) {
-                    char buf[4];
-                    buf[0] = (char)(0xE0 | (ch >> 12));
-                    buf[1] = (char)(0x80 | ((ch >> 6) & 0x3F));
-                    buf[2] = (char)(0x80 | (ch & 0x3F));
-                    allText.append(buf, 3);
-                } else if (ch >= 0x20 && ch < 0x80) {
-                    allText += (char)ch;
-                } else if (ch == 0x000D) {
-                    allText += '\r';
-                }
-            }
-            size_t start = 0;
-            while (start < allText.size()) {
-                size_t end = allText.find('\r', start);
-                if (end == std::string::npos) end = allText.size();
-                std::string para = trimTrailing(allText.substr(start, end - start));
-                if (!para.empty()) {
-                    DocContentElement elem;
-                    elem.type = DocElementType::PARAGRAPH;
-                    elem.text = para;
-                    contentElements.push_back(elem);
-                }
-                start = end + 1;
-            }
-        }
-    }
-
-    if (contentElements.empty()) {
-        DocContentElement elem;
-        elem.type = DocElementType::PARAGRAPH;
-        elem.text = "(Empty document)";
-        contentElements.push_back(elem);
-    }
-
-    // Count content types
-    int paraCount = 0, tableCount = 0, imageCount = 0;
-    for (const auto& elem : contentElements) {
-        if (elem.type == DocElementType::PARAGRAPH) paraCount++;
-        else if (elem.type == DocElementType::TABLE) tableCount++;
-        else if (elem.type == DocElementType::IMAGE_PLACEHOLDER) imageCount++;
-    }
-    OH_LOG_INFO(LOG_APP, "DOC: Content: %{public}d paragraphs, %{public}d tables, %{public}d image placeholders",
+    OH_LOG_INFO(LOG_APP, "DOC: Detected %{public}d paragraphs, %{public}d tables, %{public}d images",
                 paraCount, tableCount, imageCount);
 
-    // Step 6: Extract images from Data stream
-    std::vector<ExtractedImage> images;
-    for (const auto& entry : entries) {
-        if (entry.name == "Data") {
-            std::vector<uint8_t> dataStream;
-            if (readOLE2Stream(fileData.data(), fileSize, entry, dataStream)) {
-                OH_LOG_INFO(LOG_APP, "DOC: Data stream size: %{public}d bytes", (int)dataStream.size());
-                images = extractImagesFromDataStream(dataStream);
-            }
-            break;
+    // Write DOCX using DocxWriter from docx_writer.hpp
+    OH_LOG_INFO(LOG_APP, "DOC: STEP A - creating DocxWriter");
+    DocxWriter writer;
+    OH_LOG_INFO(LOG_APP, "DOC: STEP B - DocxWriter created OK");
+
+    OH_LOG_INFO(LOG_APP, "DOC: STEP C - checking elements vector, size=%{public}d", (int)elements.size());
+    for (int i = 0; i < (int)elements.size() && i < 20; i++) {
+        const auto& elem = elements[i];
+        OH_LOG_INFO(LOG_APP, "DOC: Element[%{public}d]: isTable=%{public}d, isImage=%{public}d, textLen=%{public}d",
+                    i, elem.isTable ? 1 : 0, elem.isImage ? 1 : 0, (int)elem.text.length());
+        if (elem.isTable) {
+            OH_LOG_INFO(LOG_APP, "DOC: Element[%{public}d] table rows=%{public}d", i, (int)elem.table.rows.size());
         }
     }
+    OH_LOG_INFO(LOG_APP, "DOC: STEP D - elements check OK");
 
-    // Also check ObjectPool storage for images
-    if (images.empty()) {
-        for (const auto& entry : entries) {
-            if (entry.name.find("ObjectPool") != std::string::npos ||
-                entry.name.find("ObjInfo") != std::string::npos) {
-                OH_LOG_INFO(LOG_APP, "DOC: Found ObjectPool entry: %{public}s (size=%{public}d)",
-                            entry.name.c_str(), (int)entry.size);
-            }
-        }
-    }
-
-    // Step 7: Generate DOCX structure
-    std::vector<std::pair<std::string, std::vector<uint8_t>>> docxFiles;
-
-    // Build content types
-    std::string contentTypes =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
-        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
-        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
-        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>";
-
-    // Add image content types if we have images
-    bool hasPng = false, hasJpeg = false, hasBmp = false;
-    for (const auto& img : images) {
-        if (img.extension == "png") hasPng = true;
-        else if (img.extension == "jpeg") hasJpeg = true;
-        else if (img.extension == "bmp") hasBmp = true;
-    }
-    if (hasPng) contentTypes += "<Default Extension=\"png\" ContentType=\"image/png\"/>";
-    if (hasJpeg) contentTypes += "<Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>";
-    if (hasBmp) contentTypes += "<Default Extension=\"bmp\" ContentType=\"image/bmp\"/>";
-
-    contentTypes +=
-        "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
-        "</Types>";
-    docxFiles.push_back({"[Content_Types].xml", std::vector<uint8_t>(contentTypes.begin(), contentTypes.end())});
-
-    // _rels/.rels
-    std::string rels =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
-        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
-        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>"
-        "</Relationships>";
-    docxFiles.push_back({"_rels/.rels", std::vector<uint8_t>(rels.begin(), rels.end())});
-
-    // Add image files to docx
-    int imageIdx = 0;
-    for (const auto& img : images) {
-        imageIdx++;
-        std::string imgName = "word/media/image" + std::to_string(imageIdx) + "." + img.extension;
-        docxFiles.push_back({imgName, img.data});
-    }
-
-    // Build document.xml.rels
-    std::string docRels =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
-        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">";
-
-    // Add image relationships
-    for (int i = 0; i < (int)images.size(); i++) {
-        std::string rId = "rIdImg" + std::to_string(i + 1);
-        std::string target = "media/image" + std::to_string(i + 1) + "." + images[i].extension;
-        docRels += "<Relationship Id=\"" + rId +
-                   "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"" +
-                   target + "\"/>";
-    }
-    docRels += "</Relationships>";
-
-    // Build document.xml body
-    std::string documentXml =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
-        "<w:document xmlns:wpc=\"http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas\" "
-        "xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" "
-        "xmlns:o=\"urn:schemas-microsoft-com:office:office\" "
-        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" "
-        "xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\" "
-        "xmlns:v=\"urn:schemas-microsoft-com:vml\" "
-        "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" "
-        "xmlns:w10=\"urn:schemas-microsoft-com:office:word\" "
-        "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
-        "xmlns:wne=\"http://schemas.microsoft.com/office/word/2006/wordml\">"
-        "<w:body>";
-
-    // Track next image to insert for image placeholders
-    int nextImageIdx = 0;
-
-    for (const auto& elem : contentElements) {
-        if (elem.type == DocElementType::PARAGRAPH) {
-            std::string escaped = xmlEscape(elem.text);
-            documentXml += "<w:p><w:r><w:t xml:space=\"preserve\">" + escaped + "</w:t></w:r></w:p>";
-
-        } else if (elem.type == DocElementType::TABLE) {
-            const auto& tbl = elem.table;
-            if (tbl.rows.empty()) continue;
-
-            // Find max columns
-            size_t maxCols = 0;
-            for (const auto& row : tbl.rows) {
-                if (row.cells.size() > maxCols) maxCols = row.cells.size();
-            }
-            if (maxCols == 0) continue;
-
-            // Table properties
-            documentXml += "<w:tbl>";
-            documentXml += "<w:tblPr><w:tblStyle w:val=\"TableGrid\"/>"
-                          "<w:tblW w:w=\"5000\" w:type=\"pct\"/>"
-                          "<w:tblBorders>"
-                          "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>"
-                          "<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>"
-                          "<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>"
-                          "<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>"
-                          "<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>"
-                          "<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>"
-                          "</w:tblBorders></w:tblPr>";
-
-            // Table grid (column widths)
-            documentXml += "<w:tblGrid>";
-            for (size_t c = 0; c < maxCols; c++) {
-                documentXml += "<w:gridCol w:w=\"" + std::to_string(9000 / maxCols) + "\"/>";
-            }
-            documentXml += "</w:tblGrid>";
-
-            // Table rows — with gridSpan support for merged cells
-            for (const auto& row : tbl.rows) {
-                documentXml += "<w:tr>";
-                // Emit cells from the row data (each may span multiple grid columns)
-                for (size_t c = 0; c < row.cells.size(); c++) {
-                    std::string cellText = xmlEscape(row.cells[c].text);
-                    int span = row.cells[c].colSpan;
-                    if (span < 1) span = 1;
-
-                    // Build tcPr with optional gridSpan, vMerge, borders
-                    std::string tcPr = "<w:tcPr>";
-                    if (span > 1) {
-                        tcPr += "<w:gridSpan w:val=\"" + std::to_string(span) + "\"/>";
-                    }
-                    if (row.cells[c].vMergeRestart) {
-                        tcPr += "<w:vMerge w:val=\"restart\"/>";
-                    } else if (row.cells[c].vMergeContinue) {
-                        tcPr += "<w:vMerge w:val=\"continue\"/>";
-                    }
-                    if (row.cells[c].vertAlign > 0) {
-                        const char* valign[] = {"top", "center", "bottom"};
-                        tcPr += "<w:vAlign w:val=\"" + std::string(valign[row.cells[c].vertAlign]) + "\"/>";
-                    }
-
-                    // Cell borders
-                    std::string borders;
-                    borders += borderToXml("top", row.cells[c].brcTop);
-                    borders += borderToXml("left", row.cells[c].brcLeft);
-                    borders += borderToXml("bottom", row.cells[c].brcBottom);
-                    borders += borderToXml("right", row.cells[c].brcRight);
-                    if (!borders.empty()) {
-                        tcPr += "<w:tcBorders>" + borders + "</w:tcBorders>";
-                    }
-
-                    // Shading
-                    std::string shading = shdToXml(row.cells[c].shdBits);
-                    if (!shading.empty()) {
-                        tcPr += shading;
-                    }
-
-                    // Text direction for vertical cells
-                    if (row.cells[c].textDirection > 0) {
-                        const char* dirs[] = {"lrTb", "tbRl", "btLr"};
-                        tcPr += "<w:textDirection w:val=\"" + std::string(dirs[row.cells[c].textDirection]) + "\"/>";
-                    }
-
-                    tcPr += "<w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr>";
-
-                    // Handle multi-line cell text (\n → separate <w:p> elements)
-                    std::string cellBody;
-                    size_t lineStart = 0;
-                    bool firstLine = true;
-                    for (size_t ch = 0; ch <= cellText.size(); ch++) {
-                        if (ch == cellText.size() || cellText[ch] == '\n') {
-                            std::string line = cellText.substr(lineStart, ch - lineStart);
-                            if (!firstLine) {
-                                cellBody += "</w:p><w:p>";
-                            }
-                            cellBody += "<w:r><w:t xml:space=\"preserve\">" + line + "</w:t></w:r>";
-                            firstLine = false;
-                            lineStart = ch + 1;
-                        }
-                    }
-                    if (cellBody.empty()) {
-                        cellBody = "<w:r><w:t xml:space=\"preserve\"></w:t></w:r>";
-                    }
-
-                    documentXml += "<w:tc>" + tcPr +
-                                  "<w:p>" + cellBody + "</w:p>"
-                                  "</w:tc>";
-                }
-                documentXml += "</w:tr>";
-            }
-            documentXml += "</w:tbl>";
-
-        } else if (elem.type == DocElementType::IMAGE_PLACEHOLDER) {
-            // Insert image if available
-            if (nextImageIdx < (int)images.size()) {
-                std::string rId = "rIdImg" + std::to_string(nextImageIdx + 1);
-                int imgW = 4000000;  // Default width in EMU (about 10cm)
-                int imgH = 3000000;  // Default height in EMU
-                std::string imgName = "image" + std::to_string(nextImageIdx + 1) + "." +
-                                     images[nextImageIdx].extension;
-
-                documentXml += "<w:p><w:r><w:drawing>"
-                    "<wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">"
-                    "<wp:extent cx=\"" + std::to_string(imgW) + "\" cy=\"" + std::to_string(imgH) + "\"/>"
-                    "<wp:docPr id=\"" + std::to_string(nextImageIdx + 1) + "\" name=\"" + imgName + "\"/>"
-                    "<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
-                    "<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
-                    "<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
-                    "<pic:nvPicPr><pic:cNvPr id=\"" + std::to_string(nextImageIdx + 1) +
-                    "\" name=\"" + imgName + "\"/>"
-                    "<pic:cNvPicPr/></pic:nvPicPr>"
-                    "<pic:blipFill><a:blip r:embed=\"" + rId + "\"/>"
-                    "<a:stretch><a:fillRect/></a:stretch></pic:blipFill>"
-                    "<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/>"
-                    "<a:ext cx=\"" + std::to_string(imgW) + "\" cy=\"" + std::to_string(imgH) + "\"/>"
-                    "</a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>"
-                    "</pic:pic></a:graphicData></a:graphic>"
-                    "</wp:inline></w:drawing></w:r></w:p>";
-                nextImageIdx++;
-            }
-        }
-    }
-
-    // Section properties
-    documentXml +=
-        "<w:sectPr>"
-        "<w:pgSz w:w=\"11906\" w:h=\"16838\"/>"
-        "<w:pgMar w:top=\"1440\" w:right=\"1800\" w:bottom=\"1440\" w:left=\"1800\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>"
-        "</w:sectPr>"
-        "</w:body></w:document>";
-
-    docxFiles.push_back({"word/document.xml", std::vector<uint8_t>(documentXml.begin(), documentXml.end())});
-    docxFiles.push_back({"word/_rels/document.xml.rels", std::vector<uint8_t>(docRels.begin(), docRels.end())});
-
-    // Step 8: Create ZIP output
-    if (!createZIP(outputPath, docxFiles)) {
-        result.errorMsg = "Failed to create ZIP output";
+    OH_LOG_INFO(LOG_APP, "DOC: STEP E - outputPath=%{public}s, len=%{public}d", outputPath.c_str(), (int)outputPath.length());
+    OH_LOG_INFO(LOG_APP, "DOC: STEP F - calling writeDocument");
+    try {
+        writer.writeDocument(elements, outputPath);
+        OH_LOG_INFO(LOG_APP, "DOC: STEP G - writeDocument returned OK");
+    } catch (const std::exception& e) {
+        OH_LOG_ERROR(LOG_APP, "DOC: writeDocument EXCEPTION: %{public}s", e.what());
+        result.success = false;
+        return false;
+    } catch (...) {
+        OH_LOG_ERROR(LOG_APP, "DOC: writeDocument UNKNOWN EXCEPTION");
+        result.success = false;
         return false;
     }
 
@@ -4749,7 +5853,7 @@ bool OfficeConverter::convertDOC(const std::string& inputPath, const std::string
     result.outputPath = outputPath;
     result.pageCount = paraCount + tableCount;
     OH_LOG_INFO(LOG_APP, "DOC: Conversion successful, %{public}d paragraphs, %{public}d tables, %{public}d images, output=%{public}s",
-                paraCount, tableCount, (int)images.size(), outputPath.c_str());
+                paraCount, tableCount, imageCount, outputPath.c_str());
     return true;
 }
 
